@@ -1150,14 +1150,14 @@ async function restoreFromTrash(colName, id) {
   const opts = { ownerUid: e.ownerUid };
 
   if (colName === 'line') {
-    opts.tripOps = [{ tripId: e.tripId, op: 'restore', lineId: e.lineId }];
+    opts.tripOps = [{ tripId: e.tripId, op: 'restore', lineId: e.lineId, effects: [] }];
     // Bij weghalen ging de telling eraf; bij terugzetten komt hij er weer bij.
     const t = tripById(e.tripId);
     const line = (t?.removed || []).find((l) => l.lineId === e.lineId);
     const p = line?.productId ? state.products.get(line.productId) : null;
     if (p?.name && (!line.added || COUNT_ADDED_TO_TRIP)) {
       const eff = countEffect(p, t.storeId, 1);
-      if (eff) opts.effects = [eff];
+      if (eff) opts.tripOps[0].effects.push(eff);
     }
     label = `${e.name} terug in ronde ${tripById(e.tripId)?.storeName || ''}`.trim();
   } else if (colName === 'items') {
@@ -1215,7 +1215,7 @@ async function maybePurgeLines() {
     const old = (t.removed || []).filter((l) => toMillisSafe(l.removedAt) < limit).map((l) => l.lineId);
     if (!old.length) continue;
     try {
-      await purgeTripLines(state.hid, t.id, old);
+      await purgeTripLines(state.hid, state.user, t, old);
     } catch (err) {
       console.warn('Opruimen rondes mislukt:', err?.message);
     }
@@ -2262,10 +2262,11 @@ async function saveTripItem() {
       checkedAt: t.finishedAt || null,
       added: true,
     };
-    tripOps.push({ tripId: t.id, op: 'add', line });
+    const op = { tripId: t.id, op: 'add', line, effects: [] };
+    tripOps.push(op);
     if (COUNT_ADDED_TO_TRIP && p) {
       const e = countEffect(p, t.storeId, 1);
-      if (e) effects.push(e);
+      if (e) op.effects.push(e);
       if (toMillisSafe(t.finishedAt) > toMillisSafe(p.lastBoughtAt)) {
         changes.push({
           col: 'products',
@@ -2298,13 +2299,13 @@ async function removeFromTrip(mode) {
   const line = lineOf(t, s.lineId);
   closeSheet();
   if (!t || !line) return;
-  const tripOps = [{ tripId: t.id, op: 'remove', lineId: line.lineId, toTrash: mode === 'gone' }];
+  const tripOps = [{ tripId: t.id, op: 'remove', lineId: line.lineId, toTrash: mode === 'gone', effects: [] }];
   const effects = [];
   const creates = [];
   const p = line.productId ? state.products.get(line.productId) : null;
   if (p?.name && (!line.added || COUNT_ADDED_TO_TRIP)) {
     const e = countEffect(p, t.storeId, -1);
-    if (e) effects.push(e);
+    if (e) tripOps[0].effects.push(e);
   }
   let note = mode === 'gone' ? ' (in de prullenbak)' : '';
   if (mode === 'back') {
@@ -2442,7 +2443,7 @@ async function doFinish(listId, storeId, choices) {
     const to = storeById(c.storeId);
     if (!to) return { item, choice: 'stay' };
     const product = liveProduct(item.productId);
-    return { item, choice: 'forward', storeId: to.id, sectionId: resolveSection(product, to, item.name), productLive: productExists(item.productId) };
+    return { item, choice: 'forward', storeId: to.id, sectionId: resolveSection(product, to, item.name), productOwnerUid: productOwner(item.productId) };
   });
 
   // 'Iedere keer': direct weer op de lijst, bij de vaste winkel van het product.
@@ -2482,7 +2483,7 @@ async function doFinish(listId, storeId, choices) {
     const p = state.products.get(i.productId);
     if (!p?.name || seen.has(p.id)) continue;
     seen.add(p.id);
-    products.push({ id: p.id, before: { lastBoughtAt: p.lastBoughtAt ?? null, lastBoughtStoreId: p.lastBoughtStoreId ?? null } });
+    products.push({ id: p.id, ownerUid: p.ownerUid, before: { lastBoughtAt: p.lastBoughtAt ?? null, lastBoughtStoreId: p.lastBoughtStoreId ?? null } });
   }
 
   const res = await run(() =>
@@ -2570,6 +2571,8 @@ function productArg(pid, extra = {}) {
 
 // Bestaat het productdocument nog (ook in de prullenbak)? Dan mag een teller erop.
 const productExists = (id) => !!id && !!state.products.get(id)?.name;
+// Eigenaar van het product (als het nog bestaat), voor tellers.
+const productOwner = (id) => (productExists(id) ? state.products.get(id).ownerUid : null);
 
 async function quickAdd(text) {
   const list = activeList();
@@ -2691,7 +2694,7 @@ async function saveSheetItem() {
   if (!Object.keys(changes).length && !productUpdates && !extraChanges.length) return;
 
   const actionId = await run(() =>
-    updateItem(state.hid, state.user, item, changes, productUpdates, { productLive: productExists(changes.productId || item.productId), extraChanges }),
+    updateItem(state.hid, state.user, item, changes, productUpdates, { productOwnerUid: productOwner(changes.productId || item.productId), extraChanges }),
   );
   if (actionId) {
     toast(changes.storeId ? `${name} → ${storeById(changes.storeId)?.name}` : `${name} aangepast`, actionId);
@@ -2752,7 +2755,7 @@ async function removeSection(sec) {
   const target = (sec.custom && sectionByKey(sec.parentKey)) || fallbackSection();
   const moved = itemsInSection(sec.id);
   const after = sec.custom ? { deleted: true, deletedAt: nowTs() } : { deleted: true };
-  const changes = [{ col: 'sections', id: sec.id, before: { deleted: false }, after }];
+  const changes = [{ col: 'sections', id: sec.id, before: sec.custom ? { deleted: false, deletedAt: null } : { deleted: false }, after }];
   for (const i of moved) changes.push({ col: 'items', id: i.id, before: { sectionId: sec.id }, after: { sectionId: target.id } });
   const label = `${sec.name} ${isStandard(sec) ? 'verborgen' : 'verwijderd'}${moved.length ? ` (${moved.length} naar ${target.name})` : ''}`;
   const actionId = await run(() => applyChanges(state.hid, state.user, { type: 'compound', label, changes }));
@@ -2786,14 +2789,34 @@ async function resetStandardSections() {
   if (actionId) toast('Standaardsecties hersteld', actionId);
 }
 
+const undoing = new Set();
 async function undoById(id) {
   const action = state.activity.find((a) => a.id === id);
   if (!action) {
     toast('Deze actie kan niet meer ongedaan worden gemaakt.');
     return;
   }
-  const done = await run(() => undoAction(state.hid, state.user, action));
-  if (done !== null) toast(`Ongedaan: ${action.label}`);
+  if (undoing.has(id) || state.activity.some((a) => a.type === 'undo' && a.undoOf === id)) {
+    toast('Dat is al ongedaan gemaakt.');
+    return;
+  }
+  // Een product terug uit de prullenbak halen terwijl er al een product met die naam is: niet doen.
+  for (const c of action.changes || []) {
+    if (c.col !== 'products' || c.before?.deleted !== false || c.after?.deleted !== true) continue;
+    const p = state.products.get(c.id);
+    const clash = p && productOf(p.ownerUid, p.key || productKey(p.name || ''));
+    if (clash && clash.id !== c.id) {
+      toast(`Kan niet: er is intussen al een product "${clash.name}".`);
+      return;
+    }
+  }
+  undoing.add(id);
+  try {
+    const done = await run(() => undoAction(state.hid, state.user, action));
+    if (done !== null) toast(`Ongedaan: ${action.label}`);
+  } finally {
+    setTimeout(() => undoing.delete(id), 5000);
+  }
 }
 
 // ---------- data koppelen ----------
@@ -3017,7 +3040,7 @@ document.addEventListener('click', async (e) => {
     case 'toggle': {
       const item = state.items.find((i) => i.id === id);
       if (!item) break;
-      const actionId = await run(() => setItemChecked(state.hid, state.user, item, !item.checked, productExists(item.productId)));
+      const actionId = await run(() => setItemChecked(state.hid, state.user, item, !item.checked, productOwner(item.productId)));
       if (actionId) toast(`${item.name} ${item.checked ? 'teruggezet' : 'afgevinkt'}`, actionId);
       break;
     }

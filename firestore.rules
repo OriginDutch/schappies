@@ -41,9 +41,15 @@ service cloud.firestore {
     }
 
     // Ligt al langer dan 7 dagen in de prullenbak (deleted-vlag + tijdstip).
+    // deletedAt kan ontbreken of null zijn (ongedaan gemaakte toevoeging): dan updatedAt.
     function trashedLongEnough() {
       return resource.data.get('deleted', false) == true
-        && request.time > resource.data.get('deletedAt', resource.data.updatedAt) + duration.value(7, 'd');
+        && (
+          (resource.data.get('deletedAt', null) != null
+            && request.time > resource.data.deletedAt + duration.value(7, 'd'))
+          || (resource.data.get('deletedAt', null) == null
+            && request.time > resource.data.updatedAt + duration.value(7, 'd'))
+        );
     }
 
     // De uitnodiging die bij deze batch hoort was nog vrij, en is in déze batch

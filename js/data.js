@@ -17,6 +17,7 @@ import {
   onSnapshot,
   writeBatch,
   runTransaction,
+  waitForPendingWrites,
   deleteDoc,
   serverTimestamp,
   increment,
@@ -576,8 +577,8 @@ export async function addItem(hid, user, list, fields, product) {
   return { itemId: iRef.id, actionId };
 }
 
-// productLive: bestaat het product nog? Anders geen teller bijhouden.
-export async function setItemChecked(hid, user, item, checked, productLive = true) {
+// productOwnerUid: eigenaar van het product als dat nog bestaat; null = geen teller.
+export async function setItemChecked(hid, user, item, checked, productOwnerUid = null) {
   const batch = writeBatch(db);
   batch.update(ref(hid, 'items', item.id), {
     checked,
@@ -588,8 +589,8 @@ export async function setItemChecked(hid, user, item, checked, productLive = tru
   });
   // Afvinken telt als "gekocht bij deze winkel"; terugzetten draait dat terug.
   const productEffect =
-    item.productId && productLive
-      ? { productId: item.productId, ownerUid: item.ownerUid, path: ['storeCounts', item.storeId], delta: checked ? 1 : -1 }
+    item.productId && productOwnerUid
+      ? { productId: item.productId, ownerUid: productOwnerUid, path: ['storeCounts', item.storeId], delta: checked ? 1 : -1 }
       : null;
   applyProductEffect(batch, hid, productEffect);
   const actionId = logAction(batch, hid, user, {
@@ -608,7 +609,7 @@ export async function setItemChecked(hid, user, item, checked, productLive = tru
 // changes: subset van { name, key, productId, qty, unit, storeId, sectionId }
 // productUpdates: geheugen bijwerken (sectie/eenheid corrigeren), of null.
 // extraChanges: [{ col, id, before, after }] die mee ongedaan gemaakt worden (bijv. 'iedere keer').
-export async function updateItem(hid, user, item, changes, productUpdates, { productLive = true, extraChanges = [] } = {}) {
+export async function updateItem(hid, user, item, changes, productUpdates, { productOwnerUid = null, extraChanges = [] } = {}) {
   const batch = writeBatch(db);
   const before = Object.fromEntries(Object.keys(changes).map((k) => [k, item[k] ?? null]));
   batch.update(ref(hid, 'items', item.id), { ...changes, updatedAt: serverTimestamp(), updatedBy: user.uid });
@@ -624,10 +625,10 @@ export async function updateItem(hid, user, item, changes, productUpdates, { pro
   // Ander winkel = doorsturen. Bijhouden voor de suggesties (3x zelfde richting).
   let productEffect = null;
   const moved = changes.storeId && changes.storeId !== item.storeId;
-  if (moved && productLive && (changes.productId || item.productId)) {
+  if (moved && productOwnerUid && (changes.productId || item.productId)) {
     productEffect = {
       productId: changes.productId || item.productId,
-      ownerUid: item.ownerUid,
+      ownerUid: productOwnerUid,
       path: ['forwardStats', `${item.storeId}__${changes.storeId}`],
       delta: 1,
     };
@@ -665,7 +666,7 @@ export async function deleteItem(hid, user, item) {
     label: `${item.name} verwijderd`,
     ownerUid: item.ownerUid,
     target: { col: 'items', id: item.id },
-    before: { deleted: false, archived: false },
+    before: { deleted: false, archived: false, deletedAt: null },
     after: { deleted: true, archived: true },
   });
   await batch.commit();
@@ -681,12 +682,16 @@ const conflict = (msg) => Object.assign(new Error(msg), { code: 'round-changed' 
 // Een ronde afronden bij één winkel, voor één lijst. Als transactie: eerst
 // controleren dat niemand anders hem net heeft afgerond of aangepast.
 // checked: afgevinkte items → naar de historie (archived + tripId).
-// open: [{ item, choice: 'stay'|'forward'|'trash', storeId, sectionId, productLive }]
+// open: [{ item, choice: 'stay'|'forward'|'trash', storeId, sectionId, productOwnerUid }]
 // recurring: [{ fields, productId }] → nieuwe items voor 'iedere keer'-producten.
 // products: [{ id, before }] → lastBoughtAt/lastBoughtStoreId bijwerken.
 export async function finishRound(hid, user, { list, store, checked, open, recurring, products, names }) {
   const writes = checked.length + open.length * 2 + recurring.length + products.length + 3;
   if (writes > MAX_WRITES) throw Object.assign(new Error('Te veel items in één ronde.'), { code: 'too-big' });
+
+  // Eerst alles wat dit toestel nog moet versturen (bijv. net afgevinkt) naar de
+  // server, anders ziet de transactie de oude stand. Zonder verbinding: duidelijke fout.
+  await pendingWritesOrOffline();
 
   const tRef = checked.length ? doc(col(hid, 'trips')) : null;
   const newItemRefs = recurring.map(() => doc(col(hid, 'items')));
@@ -742,8 +747,8 @@ export async function finishRound(hid, user, { list, store, checked, open, recur
       if (o.choice === 'forward' && o.storeId && o.storeId !== o.item.storeId) {
         before = { storeId: o.item.storeId, sectionId: o.item.sectionId ?? null };
         after = { storeId: o.storeId, sectionId: o.sectionId ?? null };
-        if (o.item.productId && o.productLive) {
-          const e = { productId: o.item.productId, ownerUid: o.item.ownerUid, path: ['forwardStats', `${o.item.storeId}__${o.storeId}`], delta: 1 };
+        if (o.item.productId && o.productOwnerUid) {
+          const e = { productId: o.item.productId, ownerUid: o.productOwnerUid, path: ['forwardStats', `${o.item.storeId}__${o.storeId}`], delta: 1 };
           applyProductEffect(tx, hid, e);
           effects.push(e);
         }
@@ -763,7 +768,8 @@ export async function finishRound(hid, user, { list, store, checked, open, recur
 
     for (const p of products) {
       const after = { lastBoughtAt: now, lastBoughtStoreId: store.id };
-      tx.update(ref(hid, 'products', p.id), { ...after, updatedAt: serverTimestamp() });
+      // merge + eigenaar: werkt ook als een ander toestel het product net heeft opgeruimd.
+      tx.set(ref(hid, 'products', p.id), { ...after, ownerUid: p.ownerUid, updatedAt: serverTimestamp() }, { merge: true });
       changes.push({ col: 'products', id: p.id, before: p.before, after });
     }
 
@@ -772,6 +778,16 @@ export async function finishRound(hid, user, { list, store, checked, open, recur
     return aRef.id;
   });
   return { tripId: tRef?.id || null, actionId };
+}
+
+async function pendingWritesOrOffline() {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    throw Object.assign(new Error('offline'), { code: 'unavailable' });
+  }
+  await Promise.race([
+    waitForPendingWrites(db),
+    new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('offline'), { code: 'unavailable' })), 15000)),
+  ]);
 }
 
 const newLineId = () => Math.random().toString(36).slice(2, 10);
@@ -865,11 +881,14 @@ function applyTripOp(trip, op) {
 
 // Bewerkingen op rondes uitvoeren binnen een transactie. strict: een regel die er
 // niet meer is = fout (bij gewone acties); bij undo gewoon overslaan.
-async function runTripOps(tx, hid, tripOps, strict) {
+// Een op kan tellers meedragen (effects): die gaan alleen mee als de op echt
+// uitgevoerd wordt, zodat undo na een gelijktijdige wijziging niet dubbel telt.
+async function runTripOps(tx, hid, tripOps, strict, sign = 1) {
   const ids = [...new Set(tripOps.map((t) => t.tripId))];
   const snaps = await Promise.all(ids.map((id) => tx.get(ref(hid, 'trips', id))));
   const trips = new Map(snaps.map((sn, k) => [ids[k], sn.exists() ? sn.data() : null]));
   const inverses = [];
+  const changed = new Set();
   for (const t of tripOps) {
     const trip = trips.get(t.tripId);
     const res = trip && applyTripOp(trip, t);
@@ -879,15 +898,17 @@ async function runTripOps(tx, hid, tripOps, strict) {
     }
     trip.items = res.items;
     trip.removed = res.removed;
-    if (res.inverse) inverses.unshift({ tripId: t.tripId, ...res.inverse });
+    changed.add(t.tripId);
+    for (const e of t.effects || []) applyProductEffect(tx, hid, e, sign);
+    if (res.inverse) inverses.unshift({ tripId: t.tripId, ...res.inverse, effects: t.effects || [] });
   }
   const write = () => {
-    for (const id of ids) {
+    for (const id of changed) {
       const trip = trips.get(id);
       if (trip) tx.update(ref(hid, 'trips', id), { items: trip.items || [], removed: trip.removed || [], updatedAt: serverTimestamp() });
     }
   };
-  return { inverses, write };
+  return { inverses, write, count: changed.size };
 }
 
 // Algemene samengestelde wijziging, in één keer ongedaan te maken.
@@ -915,6 +936,7 @@ export async function commitCompound(hid, user, { label, ownerUid = SHARED, crea
   };
 
   if (tripOps.length) {
+    await pendingWritesOrOffline();
     await runTransaction(db, async (tx) => {
       const t = await runTripOps(tx, hid, tripOps, true);
       t.write();
@@ -931,10 +953,12 @@ export async function commitCompound(hid, user, { label, ownerUid = SHARED, crea
 }
 
 // Regels die langer dan een week in de prullenbak van een ronde liggen opruimen.
-export async function purgeTripLines(hid, tripId, lineIds) {
+export async function purgeTripLines(hid, user, trip, lineIds) {
   await runTransaction(db, async (tx) => {
-    const t = await runTripOps(tx, hid, lineIds.map((lineId) => ({ tripId, op: 'purge', lineId })), false);
+    const t = await runTripOps(tx, hid, lineIds.map((lineId) => ({ tripId: trip.id, op: 'purge', lineId })), false);
+    if (!t.count) return;
     t.write();
+    tx.set(doc(col(hid, 'activity')), logEntry(user, { type: 'trash.purge', label: `Prullenbak: ${lineIds.length} regel(s) uit ronde ${trip.storeName || ''} definitief verwijderd`, ownerUid: trip.ownerUid || SHARED }));
   });
 }
 
@@ -1076,7 +1100,8 @@ export async function undoAction(hid, user, action) {
   const hasTarget = UNDOABLE.has(action.type) && action.target && action.before;
   if (!changes.length && !effects.length && !tripUndo.length && !hasTarget) throw new Error('Niet terug te draaien');
 
-  const aRef = doc(col(hid, 'activity'));
+  // Vast id: een tweede undo van dezelfde actie wordt een update, en die weigeren de rules.
+  const aRef = doc(col(hid, 'activity'), `undo_${action.id}`);
   const writeAll = (w) => {
     if (hasTarget) {
       const fields = { ...action.before, updatedAt: serverTimestamp(), updatedBy: user.uid };
@@ -1108,7 +1133,7 @@ export async function undoAction(hid, user, action) {
 
   if (tripUndo.length) {
     await runTransaction(db, async (tx) => {
-      const t = await runTripOps(tx, hid, tripUndo, false);
+      const t = await runTripOps(tx, hid, tripUndo, false, -1);
       t.write();
       writeAll(tx);
     });

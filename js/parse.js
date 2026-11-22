@@ -133,27 +133,29 @@ export function guessParentKey(sectionName) {
 
 // ---------- indeling importeren ----------
 
-// "Gangpad 1: brood, pasta" → { name: 'Gangpad 1', items: ['Brood', 'Pasta'] }
+// Letterlijk overnemen: alleen spaties aan begin en eind gaan eraf.
+// "Gangpad 1: brood, pasta" → { name: 'Gangpad 1', items: ['brood', 'pasta'] }
 // "Fruit"                   → { name: 'Fruit', items: ['Fruit'] }
+// "Gangpad 6:"              → { name: 'Gangpad 6', items: [] }   (leeg blok blijft bestaan)
 export function parseLayoutText(text) {
   const blocks = [];
   for (const raw of String(text || '').split(/\r?\n/)) {
-    const line = raw.trim().replace(/^[-*•]\s*/, '');
+    const line = raw.trim();
     if (!line) continue;
     const i = line.indexOf(':');
     if (i === -1) {
-      blocks.push({ name: capitalize(line), items: [capitalize(line)] });
+      blocks.push({ name: line, items: [line] });
       continue;
     }
-    const name = capitalize(line.slice(0, i).trim()) || `Blok ${blocks.length + 1}`;
+    const name = line.slice(0, i).trim() || `Blok ${blocks.length + 1}`;
     const items = line
       .slice(i + 1)
-      .split(/[,;]/)
-      .map((s) => capitalize(s.trim().replace(/\s+/g, ' ')))
+      .split(',')
+      .map((s) => s.trim())
       .filter(Boolean);
     blocks.push({ name, items });
   }
-  return blocks.filter((b) => b.items.length);
+  return blocks;
 }
 
 const normName = (s) =>

@@ -840,6 +840,7 @@ Koeling: koeling (zuivel), koeling (vlees)</pre>
           (b, bi) => `
         <div class="import-block">
           <h3 class="chain-group-title"><span class="layout-num mono">${bi + 1}</span> ${esc(b.name)}</h3>
+          ${b.rows.length ? '' : '<p class="muted small">Leeg blok</p>'}
           ${b.rows
             .map((r) => {
               const exact = r.candidates[0] && r.candidates[0].score >= 1 && r.choice === r.candidates[0].id;
@@ -897,13 +898,12 @@ async function applyImport(store) {
         ids.push(id);
       }
       return { id: newGroupId(), name: b.name.slice(0, 40), sectionIds: ids };
-    })
-    .filter((g) => g.sectionIds.length);
+    });
 
   // Erachter plakken: bestaande blokken houden, maar zonder secties die nu een nieuwe plek krijgen.
   const layout = d.replace
     ? blocks
-    : [...storeLayout(store).map((g) => ({ ...g, sectionIds: g.sectionIds.filter((id) => !used.has(id)) })), ...blocks];
+    : [...(store.layout || []).map((g) => ({ ...g, sectionIds: (g.sectionIds || []).filter((id) => !used.has(id)) })), ...blocks];
   const off = new Set(store.disabledSectionIds || []);
   const enableIds = [...used].filter((id) => off.has(id));
   const label = `Indeling ${store.name} geïmporteerd (${blocks.length} blokken${newSections.length ? `, ${newSections.length} ${newSections.length === 1 ? 'nieuwe sectie' : 'nieuwe secties'}` : ''})`;

@@ -147,6 +147,16 @@ export async function getInvite(code) {
   return snap.exists() ? { code: snap.id, ...snap.data() } : null;
 }
 
+// Ben je (nog) lid? Een verwijderd lid mag het huishouden niet meer lezen.
+export async function isMemberOf(hid, uid) {
+  try {
+    const snap = await getDoc(householdRef(hid));
+    return snap.exists() && (snap.data().members || []).includes(uid);
+  } catch {
+    return false;
+  }
+}
+
 export function inviteStatus(invite) {
   if (!invite) return 'onbekend';
   if (invite.revoked) return 'ingetrokken';

@@ -43,6 +43,7 @@ import {
   joinHousehold,
   removeMember,
   normalizeCode,
+  isMemberOf,
   DEFAULT_SECTIONS,
 } from './data.js';
 import {
@@ -355,11 +356,12 @@ async function showJoin(code) {
   } catch (err) {
     console.error(err);
   }
-  // Al lid of al gebruikt door jezelf: gewoon door.
-  if (invite && (state.profile?.householdId === invite.hid || invite.usedBy === state.user.uid)) {
+  // Echt al lid (niet alleen volgens je profiel, want een verwijderd lid wijst nog
+  // naar het oude huishouden): gewoon door naar de lijsten.
+  if (invite && (await isMemberOf(invite.hid, state.user.uid))) {
     clearJoin();
-    if (state.profile?.householdId) startHousehold(state.profile.householdId);
-    else renderSetup();
+    state.profile = { ...(state.profile || {}), householdId: invite.hid };
+    startHousehold(invite.hid);
     return;
   }
   state.joinInvite = invite;
@@ -2498,6 +2500,7 @@ document.addEventListener('submit', async (e) => {
     btn.textContent = 'Bezig…';
     try {
       const hid = await createHousehold(state.user, name);
+      state.profile = { ...(state.profile || {}), householdId: hid };
       startHousehold(hid);
     } catch (err) {
       console.error(err);

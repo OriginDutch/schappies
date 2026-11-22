@@ -39,10 +39,13 @@ service cloud.firestore {
       return ownerUid == 'shared' || ownerUid == request.auth.uid;
     }
 
-    // De uitnodiging die bij deze batch hoort is (na de batch) door jou gebruikt.
+    // De uitnodiging die bij deze batch hoort was nog vrij, en is in déze batch
+    // door jou gebruikt. Een oude, al gebruikte uitnodiging telt dus niet.
     function joinedWith(hid, code) {
-      let inv = getAfter(/databases/$(database)/documents/invites/$(code)).data;
-      return inv.hid == hid && inv.usedBy == request.auth.uid;
+      let path = /databases/$(database)/documents/invites/$(code);
+      return get(path).data.usedBy == null
+        && getAfter(path).data.hid == hid
+        && getAfter(path).data.usedBy == request.auth.uid;
     }
 
     // Uitnodigingen. De code is het geheim: wie hem kent mag hem lezen, maar
@@ -62,9 +65,10 @@ service cloud.firestore {
         && resource.data.expiresAt > request.time
         && request.resource.data.usedBy == request.auth.uid
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedBy', 'usedAt']);
-      // Intrekken door de maker.
+      // Intrekken door de maker (en daarna niet meer terug te draaien).
       allow update: if signedIn()
         && resource.data.createdBy == request.auth.uid
+        && request.resource.data.revoked == true
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['revoked', 'revokedAt']);
       allow delete: if false;
     }
@@ -85,7 +89,10 @@ service cloud.firestore {
       allow update: if signedIn()
         && request.auth.uid in resource.data.members
         && request.resource.data.ownerUid == resource.data.ownerUid
-        && request.resource.data.members == resource.data.members;
+        && request.resource.data.members == resource.data.members
+        && request.resource.data.get('lastJoinCode', null) == resource.data.get('lastJoinCode', null)
+        && request.resource.data.get('memberNames', {}).diff(resource.data.get('memberNames', {}))
+             .affectedKeys().hasOnly([request.auth.uid]);
 
       // Meedoen via een uitnodiging: jezelf (en alleen jezelf) achteraan toevoegen,
       // in dezelfde batch waarin de uitnodiging op jouw naam als gebruikt wordt gezet.

@@ -2534,13 +2534,13 @@ async function tripAgain(t, line, { skipSuggest = false, storeId: forceStore = n
   const known = liveProduct(line.productId)?.ownerUid === list.ownerUid ? liveProduct(line.productId) : productFor(list, key);
   const pid = known && known.ownerUid === list.ownerUid ? known.id : pidFor(list.ownerUid, key);
   const p = known;
+  const dup = liveItems().find((i) => i.listId === list.id && !i.checked && i.key === key);
+  if (dup) return toast(`${dup.name} staat al op de lijst bij ${storeById(dup.storeId)?.name || 'een winkel'}`);
   if (p && !skipSuggest && suggestionFor(p)) {
     if (openSuggestion(p.id, (sid) => tripAgain(t, line, { skipSuggest: true, storeId: sid }))) return;
   }
   const store = storeById(forceStore) || storeById(p?.preferredStoreId) || storeById(t.storeId) || storeById(currentStoreId());
   if (!store) return toast('Geen winkel gevonden');
-  const dup = liveItems().find((i) => i.listId === list.id && !i.checked && i.key === key);
-  if (dup) return toast(`${dup.name} staat al op de lijst bij ${storeById(dup.storeId)?.name || 'een winkel'}`);
   const sectionId = resolveSection(p, store, line.name);
   const fields = {
     name: line.name,
@@ -2894,7 +2894,11 @@ const productExists = (id) => !!id && !!state.products.get(id)?.name;
 const productOwner = (id) => (productExists(id) ? state.products.get(id).ownerUid : null);
 
 async function quickAdd(text, { skipSuggest = false, listId = null, storeId: forceStore = null } = {}) {
-  const list = (listId && state.lists.find((l) => l.id === listId)) || activeList();
+  const list = listId ? state.lists.find((l) => l.id === listId) : activeList();
+  if (listId && !list) {
+    toast('Die lijst bestaat niet meer, het item is niet toegevoegd');
+    return false;
+  }
   const { qty, unit, name } = parseQuickAdd(text);
   if (!name || !list) return false;
   const key = productKey(name);
@@ -2939,8 +2943,8 @@ async function quickAdd(text, { skipSuggest = false, listId = null, storeId: for
     name,
     key,
     parts: [{ qty: qty ?? '', unit: unit || 'st' }],
-    storeId: activeStore,
-    sectionId: resolveSection(known, storeById(activeStore), name),
+    storeId: (storeById(forceStore) && forceStore) || activeStore,
+    sectionId: resolveSection(known, storeById((storeById(forceStore) && forceStore) || activeStore), name),
   });
   return true;
 }

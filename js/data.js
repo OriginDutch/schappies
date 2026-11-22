@@ -962,6 +962,9 @@ export async function answerSuggestion(hid, user, { productId, key, toStoreId, a
   await runTransaction(db, async (tx) => {
     const snap = await tx.get(pRef);
     const p = snap.exists() ? snap.data() : null;
+    // Items die meeverhuizen opnieuw lezen: alleen wat nog open op de lijst staat
+    // en niet al bij de nieuwe winkel, met de echte 'before' van de server.
+    const moveSnaps = answer === 'yes' ? await Promise.all(moves.map((m) => tx.get(ref(hid, 'items', m.id)))) : [];
     const n = p?.forwardStats?.[key] || 0;
     if (!p || p.deleted || p.suggestOff || n < threshold || p.preferredStoreId === toStoreId) {
       throw conflict('Deze suggestie is net al beantwoord.');
@@ -978,10 +981,14 @@ export async function answerSuggestion(hid, user, { productId, key, toStoreId, a
       tx.update(pRef, { ...after, updatedAt: serverTimestamp() });
       changes.push({ col: 'products', id: productId, before, after });
     }
-    for (const m of answer === 'yes' ? moves : []) {
+    moveSnaps.forEach((ms, k) => {
+      const d = ms.exists() ? ms.data() : null;
+      if (!d || d.deleted || d.archived || d.checked || d.storeId === toStoreId) return;
+      const m = moves[k];
+      const before = { storeId: d.storeId, sectionId: d.sectionId ?? null };
       tx.update(ref(hid, 'items', m.id), { ...m.after, updatedAt: serverTimestamp(), updatedBy: user.uid });
-      changes.push({ col: 'items', id: m.id, before: m.before, after: m.after });
-    }
+      changes.push({ col: 'items', id: m.id, before, after: m.after });
+    });
     tx.set(aRef, logEntry(user, { type: 'compound', label, ownerUid: p.ownerUid, changes, effects }));
   });
   return aRef.id;

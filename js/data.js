@@ -17,6 +17,9 @@ import {
   writeBatch,
   serverTimestamp,
   increment,
+  arrayUnion,
+  arrayRemove,
+  Timestamp,
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js';
 
 export const SCHEMA_VERSION = 1;
@@ -70,7 +73,7 @@ export async function createHousehold(user, name) {
   const now = serverTimestamp();
   const base = { schemaVersion: SCHEMA_VERSION, createdAt: now, createdBy: user.uid };
 
-  batch.set(hRef, { ...base, name, ownerUid: user.uid, members: [user.uid] });
+  batch.set(hRef, { ...base, name, ownerUid: user.uid, members: [user.uid], memberNames: { [user.uid]: user.displayName || '' } });
   batch.set(
     userRef(user.uid),
     { schemaVersion: SCHEMA_VERSION, householdId: hRef.id, displayName: user.displayName || '', updatedAt: now },
@@ -99,6 +102,112 @@ export async function createHousehold(user, name) {
 
   await batch.commit();
   return hRef.id;
+}
+
+// ---------- uitnodigen ----------
+
+const INVITE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // geen 0/O en 1/I
+const INVITE_HOURS = 24;
+
+function randomCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  return [...bytes].map((b) => INVITE_ALPHABET[b % INVITE_ALPHABET.length]).join('');
+}
+
+export const normalizeCode = (code) => String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+
+// Alleen de eigenaar. Eén keer te gebruiken, 24 uur geldig.
+export async function createInvite(hid, user, householdName) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = randomCode();
+    const iRef = doc(db, 'invites', code);
+    const existing = await getDoc(iRef).catch(() => null);
+    if (existing?.exists()) continue;
+    const batch = writeBatch(db);
+    batch.set(iRef, {
+      schemaVersion: SCHEMA_VERSION,
+      hid,
+      householdName,
+      createdBy: user.uid,
+      createdByName: user.displayName || '',
+      createdAt: serverTimestamp(),
+      expiresAt: Timestamp.fromMillis(Date.now() + INVITE_HOURS * 3600 * 1000),
+      usedBy: null,
+      usedAt: null,
+      revoked: false,
+    });
+    await batch.commit();
+    return code;
+  }
+  throw new Error('Kon geen unieke code maken, probeer opnieuw.');
+}
+
+export async function getInvite(code) {
+  const snap = await getDoc(doc(db, 'invites', normalizeCode(code)));
+  return snap.exists() ? { code: snap.id, ...snap.data() } : null;
+}
+
+export function inviteStatus(invite) {
+  if (!invite) return 'onbekend';
+  if (invite.revoked) return 'ingetrokken';
+  if (invite.usedBy) return 'gebruikt';
+  const exp = invite.expiresAt?.toMillis ? invite.expiresAt.toMillis() : 0;
+  if (exp <= Date.now()) return 'verlopen';
+  return 'geldig';
+}
+
+export function watchMyInvites(uid, onData, onError) {
+  return onSnapshot(
+    query(collection(db, 'invites'), where('createdBy', '==', uid)),
+    (snap) => onData(snap.docs.map((d) => ({ code: d.id, ...d.data() }))),
+    onError,
+  );
+}
+
+export async function revokeInvite(code) {
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'invites', code), { revoked: true, revokedAt: serverTimestamp() });
+  await batch.commit();
+}
+
+// Meedoen: uitnodiging gebruiken, jezelf toevoegen, profiel omzetten,
+// een eigen Privé-lijst aanmaken en het vastleggen in het log. Alles in één batch.
+export async function joinHousehold(user, invite) {
+  const hid = invite.hid;
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'invites', invite.code), { usedBy: user.uid, usedAt: serverTimestamp() });
+  batch.update(householdRef(hid), {
+    members: arrayUnion(user.uid),
+    [`memberNames.${user.uid}`]: user.displayName || '',
+    lastJoinCode: invite.code,
+    updatedAt: serverTimestamp(),
+    updatedBy: user.uid,
+  });
+  batch.set(
+    userRef(user.uid),
+    { schemaVersion: SCHEMA_VERSION, householdId: hid, displayName: user.displayName || '', updatedAt: serverTimestamp() },
+    { merge: true },
+  );
+  batch.set(doc(col(hid, 'lists')), {
+    schemaVersion: SCHEMA_VERSION,
+    name: 'Privé',
+    ownerUid: user.uid,
+    order: 1,
+    deleted: false,
+    createdAt: serverTimestamp(),
+    createdBy: user.uid,
+  });
+  logAction(batch, hid, user, { type: 'member.join', label: `${user.displayName || 'Iemand'} doet mee` });
+  await batch.commit();
+  return hid;
+}
+
+// Alleen de eigenaar. Haar/zijn privélijst blijft bestaan, maar is voor niemand anders zichtbaar.
+export async function removeMember(hid, user, memberUid, memberName) {
+  const batch = writeBatch(db);
+  batch.update(householdRef(hid), { members: arrayRemove(memberUid), updatedAt: serverTimestamp(), updatedBy: user.uid });
+  logAction(batch, hid, user, { type: 'member.remove', label: `${memberName || 'Lid'} verwijderd uit het huishouden` });
+  await batch.commit();
 }
 
 // ---------- luisteren ----------

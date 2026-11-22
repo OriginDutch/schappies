@@ -35,6 +35,14 @@ import {
   watchChains,
   migrateToChains,
   importLayout,
+  createInvite,
+  getInvite,
+  inviteStatus,
+  watchMyInvites,
+  revokeInvite,
+  joinHousehold,
+  removeMember,
+  normalizeCode,
   DEFAULT_SECTIONS,
 } from './data.js';
 import {
@@ -52,6 +60,40 @@ import { initTheme, getThemePref, setThemePref } from './theme.js';
 
 const APP_VERSION = self.APP_VERSION || 'dev';
 const $app = document.getElementById('app');
+
+// ---------- uitnodigingslink (?join=CODE) ----------
+// De code wordt bewaard tot na het inloggen, en uit de adresbalk gehaald.
+const JOIN_KEY = 'bs.join';
+const pendingJoin = () => {
+  try {
+    return sessionStorage.getItem(JOIN_KEY);
+  } catch {
+    return null;
+  }
+};
+const setPendingJoin = (code) => {
+  try {
+    sessionStorage.setItem(JOIN_KEY, code);
+  } catch {
+    /* zonder opslag werkt alleen de huidige sessie */
+  }
+};
+const clearJoin = () => {
+  try {
+    sessionStorage.removeItem(JOIN_KEY);
+  } catch {
+    /* niets */
+  }
+};
+(() => {
+  const params = new URLSearchParams(location.search);
+  const code = params.get('join');
+  if (!code) return;
+  setPendingJoin(code.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6));
+  params.delete('join');
+  const q = params.toString();
+  history.replaceState(null, '', location.pathname + (q ? `?${q}` : '') + location.hash);
+})();
 
 const state = {
   user: null,
@@ -73,6 +115,9 @@ const state = {
   layoutStoreId: null,
   layoutNewSection: null,
   importDraft: null,
+  profile: null,
+  invites: [],
+  joinInvite: null,
   optSub: null,
   allSections: [],
   chains: [],
@@ -200,7 +245,11 @@ const liveItems = () => state.items.filter((i) => !i.deleted && !i.archived);
 let toastTimer = null;
 function toast(message, actionId = null) {
   const root = document.getElementById('toast-root');
-  if (!root) return;
+  if (!root) {
+    // App nog aan het laden: tonen zodra de schil er staat.
+    state.pendingToast = [message, actionId];
+    return;
+  }
   clearTimeout(toastTimer);
   root.innerHTML = `
     <div class="toast" role="status">
@@ -233,7 +282,11 @@ function renderLogin(message = '') {
     <div class="center-screen">
       <div class="auth-card">
         <h1 class="auth-title">Boodschappen</h1>
-        <p class="muted">Log in om je lijsten te openen en te synchroniseren.</p>
+        <p class="muted">${
+          pendingJoin()
+            ? 'Je bent uitgenodigd voor een huishouden. Log in met Google om mee te doen.'
+            : 'Log in om je lijsten te openen en te synchroniseren.'
+        }</p>
         <button class="btn btn-primary btn-block" data-action="login">Inloggen met Google</button>
         ${message ? `<p class="error" role="alert">${esc(message)}</p>` : ''}
       </div>
@@ -256,8 +309,68 @@ function renderSetup(message = '') {
         <button class="btn btn-ghost btn-block" type="button" data-action="logout">Ander account gebruiken</button>
         ${message ? `<p class="error" role="alert">${esc(message)}</p>` : ''}
       </form>
+      <form class="auth-card" data-form="join-code">
+        <h2 class="card-title">Uitgenodigd?</h2>
+        <p class="muted small">Vul de code in die je hebt gekregen.</p>
+        <div class="inline-form">
+          <label class="sr-only" for="join-code-setup">Uitnodigingscode</label>
+          <input id="join-code-setup" class="input mono code-input" name="code" maxlength="8" autocomplete="off" autocapitalize="characters" placeholder="ABC234">
+          <button class="btn btn-primary" type="submit">Meedoen</button>
+        </div>
+      </form>
     </div>`;
   $app.querySelector('input[name="name"]').select();
+}
+
+function renderJoin(invite, message = '') {
+  state.mounted = false;
+  const status = inviteStatus(invite);
+  const otherHousehold = state.profile?.householdId && state.profile.householdId !== invite?.hid;
+  $app.innerHTML = `
+    <div class="center-screen">
+      <div class="auth-card">
+        <p class="eyebrow">uitnodiging</p>
+        ${
+          status === 'geldig'
+            ? `<h1 class="auth-title">${esc(invite.householdName || 'Huishouden')}</h1>
+              <p class="muted">${esc(invite.createdByName || 'Iemand')} nodigt je uit om mee te doen. Je deelt dan de gedeelde lijst, winkels en looproutes. Je krijgt je eigen Privé-lijst.</p>
+              ${otherHousehold ? '<p class="muted small">Je zit nu in een ander huishouden. Als je meedoet, stap je over. Je huidige huishouden blijft gewoon bestaan.</p>' : ''}
+              <button class="btn btn-primary btn-block" data-action="join-accept">Meedoen</button>
+              <button class="btn btn-ghost btn-block" data-action="join-decline">Niet nu</button>`
+            : `<h1 class="auth-title">Werkt niet</h1>
+              <p class="muted">Deze uitnodiging is ${esc(status)}. Vraag om een nieuwe.</p>
+              <button class="btn btn-primary btn-block" data-action="join-decline">Verder</button>`
+        }
+        ${message ? `<p class="error" role="alert">${esc(message)}</p>` : ''}
+      </div>
+    </div>`;
+}
+
+// Uitnodiging openen (na inloggen, via link of ingevulde code).
+async function showJoin(code) {
+  renderBoot('Uitnodiging openen…');
+  let invite = null;
+  try {
+    invite = await getInvite(code);
+  } catch (err) {
+    console.error(err);
+  }
+  // Al lid of al gebruikt door jezelf: gewoon door.
+  if (invite && (state.profile?.householdId === invite.hid || invite.usedBy === state.user.uid)) {
+    clearJoin();
+    if (state.profile?.householdId) startHousehold(state.profile.householdId);
+    else renderSetup();
+    return;
+  }
+  state.joinInvite = invite;
+  renderJoin(invite);
+}
+
+function continueWithoutJoin() {
+  clearJoin();
+  state.joinInvite = null;
+  if (state.profile?.householdId) startHousehold(state.profile.householdId);
+  else renderSetup();
 }
 
 function renderError(err) {
@@ -301,6 +414,11 @@ function mountShell() {
     <div id="sheet-root"></div>
     <div id="toast-root" class="toast-root" aria-live="polite"></div>`;
   state.mounted = true;
+  if (state.pendingToast) {
+    const [msg, act] = state.pendingToast;
+    state.pendingToast = null;
+    setTimeout(() => toast(msg, act), 0);
+  }
 }
 
 // Alles pas tekenen als de basisdata binnen is, anders flikkert het.
@@ -1112,6 +1230,75 @@ function viewChain(chain) {
     }`;
 }
 
+function memberName(uid) {
+  const n = state.household?.memberNames?.[uid];
+  if (n) return n;
+  if (uid === state.user?.uid) return state.user.displayName || 'Jij';
+  return 'Lid';
+}
+
+function formatExpiry(ts) {
+  const ms = ts?.toMillis ? ts.toMillis() : 0;
+  return new Date(ms).toLocaleString('nl-NL', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+function inviteLink(code) {
+  return `${location.origin}${location.pathname}?join=${code}`;
+}
+
+function viewMembers(isOwner) {
+  const members = state.household?.members || [];
+  const active = state.invites
+    .filter((i) => i.hid === state.hid && inviteStatus(i) === 'geldig')
+    .sort((a, b) => (b.expiresAt?.toMillis?.() || 0) - (a.expiresAt?.toMillis?.() || 0));
+  return `
+    <section class="card">
+      <h2 class="card-title">Leden</h2>
+      <div class="member-list">
+        ${members
+          .map(
+            (uid) => `<div class="member-row">
+              <span class="member-name">${esc(memberName(uid))}${uid === state.user.uid ? ' <span class="muted small">(jij)</span>' : ''}</span>
+              <span class="muted mono small">${uid === state.household.ownerUid ? 'eigenaar' : 'lid'}</span>
+              ${
+                isOwner && uid !== state.user.uid
+                  ? `<button class="icon-btn icon-btn-quiet" data-action="member-remove" data-id="${uid}" aria-label="${esc(memberName(uid))} verwijderen uit het huishouden">${icon('trash', 18)}</button>`
+                  : ''
+              }
+            </div>`,
+          )
+          .join('')}
+      </div>
+      ${
+        isOwner
+          ? `${active
+              .map(
+                (i) => `<div class="invite">
+                  <div class="invite-main">
+                    <span class="invite-code mono">${esc(i.code)}</span>
+                    <span class="muted small">Eén keer te gebruiken · geldig tot ${esc(formatExpiry(i.expiresAt))}</span>
+                  </div>
+                  <div class="inline-form">
+                    <button class="btn btn-primary btn-sm" data-action="invite-share" data-id="${esc(i.code)}">Delen</button>
+                    <button class="btn btn-ghost btn-sm" data-action="invite-revoke" data-id="${esc(i.code)}">Intrekken</button>
+                  </div>
+                </div>`,
+              )
+              .join('')}
+            <button class="btn btn-ghost" data-action="invite-create">+ Iemand uitnodigen</button>`
+          : '<p class="muted small">Alleen de eigenaar kan mensen uitnodigen.</p>'
+      }
+      <details class="join-other">
+        <summary class="muted small">Zelf een uitnodigingscode gekregen?</summary>
+        <form class="inline-form" data-form="join-code">
+          <label class="sr-only" for="join-code-opties">Uitnodigingscode</label>
+          <input id="join-code-opties" class="input mono code-input" name="code" maxlength="8" autocomplete="off" autocapitalize="characters" placeholder="ABC234">
+          <button class="btn btn-primary" type="submit">Openen</button>
+        </form>
+      </details>
+    </section>`;
+}
+
 function viewOpties() {
   const pref = getThemePref();
   const isOwner = state.household?.ownerUid === state.user?.uid;
@@ -1135,12 +1322,13 @@ function viewOpties() {
       <dl class="rows">
         <div class="row"><dt>Naam</dt><dd>${esc(state.household?.name || '—')}</dd></div>
         <div class="row"><dt>Rol</dt><dd>${isOwner ? 'Eigenaar' : 'Lid'}</dd></div>
-        <div class="row"><dt>Leden</dt><dd class="mono">${state.household?.members?.length ?? 0}</dd></div>
         <div class="row"><dt>Winkels</dt><dd class="mono">${state.stores.length}</dd></div>
         <div class="row"><dt>Secties</dt><dd class="mono">${state.sections.length}</dd></div>
         <div class="row"><dt>Producten in geheugen</dt><dd class="mono">${state.products.size}</dd></div>
       </dl>
     </section>
+
+    ${viewMembers(isOwner)}
 
     <section class="card">
       <h2 class="card-title">Secties</h2>
@@ -1194,7 +1382,14 @@ function renderSheet() {
     root.innerHTML = '';
     return;
   }
-  const body = s.mode === 'stores' ? sheetStores() : s.mode === 'confirm-disable' ? sheetConfirmDisable(s) : sheetItem(s);
+  const body =
+    s.mode === 'stores'
+      ? sheetStores()
+      : s.mode === 'confirm-disable'
+        ? sheetConfirmDisable(s)
+        : s.mode === 'confirm-remove'
+          ? sheetConfirmRemove(s)
+          : sheetItem(s);
   root.innerHTML = `
     <div class="sheet-overlay" data-action="sheet-close"></div>
     <div class="sheet" role="dialog" aria-modal="true" aria-label="${esc(s.title || '')}">
@@ -1303,6 +1498,16 @@ function sheetConfirmDisable(s) {
       <h2 class="sheet-title">${esc(sec?.name || '')} uitzetten bij ${esc(store?.name || '')}?</h2>
       <p class="muted">Er ${s.count === 1 ? 'staat nog 1 item in deze sectie. Dat gaat' : `staan nog ${s.count} items in deze sectie. Die gaan`} naar Overig. Je kunt dit ongedaan maken.</p>
       <button class="btn btn-primary btn-block" data-action="confirm-disable">Uitzetten en naar Overig</button>
+      <button class="btn btn-ghost btn-block" data-action="sheet-close">Annuleren</button>
+    </div>`;
+}
+
+function sheetConfirmRemove(s) {
+  return `
+    <div class="sheet-body">
+      <h2 class="sheet-title">${esc(s.name)} verwijderen uit het huishouden?</h2>
+      <p class="muted">${esc(s.name)} ziet de gedeelde lijst dan niet meer. Haar of zijn Privé-lijst blijft bewaard, maar is voor jou niet zichtbaar. Opnieuw uitnodigen kan altijd.</p>
+      <button class="btn btn-primary btn-block" data-action="confirm-remove">Verwijderen</button>
       <button class="btn btn-ghost btn-block" data-action="sheet-close">Annuleren</button>
     </div>`;
 }
@@ -1581,6 +1786,10 @@ function startHousehold(hid) {
   const fatal = (err) => {
     console.error(err);
     stopWatching();
+    if (err?.code === 'permission-denied') {
+      renderSetup('Je hebt geen toegang (meer) tot je huishouden. Maak een nieuw huishouden aan of vul een uitnodigingscode in.');
+      return;
+    }
     renderError(err);
   };
   const got = (key) => {
@@ -1634,6 +1843,15 @@ function startHousehold(hid) {
       },
       fatal,
     ),
+    // Eigen uitnodigingen (alleen voor het overzicht onder Opties).
+    watchMyInvites(
+      state.user.uid,
+      (inv) => {
+        state.invites = inv;
+        if (state.view === 'opties') render();
+      },
+      (err) => console.warn('Uitnodigingen niet beschikbaar:', err?.message),
+    ),
     // Undo is een extraatje: als de index nog bouwt, werkt de rest gewoon door.
     watchActivity(
       hid,
@@ -1677,6 +1895,11 @@ onAuthStateChanged(auth, async (user) => {
   renderBoot('Huishouden laden…');
   try {
     const profile = await getUserProfile(user.uid);
+    state.profile = profile;
+    if (pendingJoin()) {
+      await showJoin(pendingJoin());
+      return;
+    }
     if (!profile?.householdId) {
       renderSetup();
       return;
@@ -1934,6 +2157,66 @@ document.addEventListener('click', async (e) => {
       state.importDraft = null;
       render();
       break;
+    case 'join-accept': {
+      const inv = state.joinInvite;
+      if (!inv) break;
+      el.disabled = true;
+      el.textContent = 'Bezig…';
+      try {
+        const hid = await joinHousehold(state.user, inv);
+        clearJoin();
+        state.joinInvite = null;
+        state.profile = { ...(state.profile || {}), householdId: hid };
+        state.view = 'lijst';
+        startHousehold(hid);
+        toast(`Welkom bij ${inv.householdName || 'het huishouden'}`);
+      } catch (err) {
+        console.error(err);
+        renderJoin(inv, friendlyError(err) || 'Meedoen lukte niet.');
+      }
+      break;
+    }
+    case 'join-decline':
+      continueWithoutJoin();
+      break;
+    case 'invite-create': {
+      el.disabled = true;
+      const code = await run(() => createInvite(state.hid, state.user, state.household?.name || ''));
+      el.disabled = false;
+      if (code) toast(`Uitnodiging ${code} gemaakt`);
+      break;
+    }
+    case 'invite-share': {
+      const link = inviteLink(id);
+      const text = `Doe mee met ons boodschappenlijstje in Schappies: ${link} (code ${id})`;
+      try {
+        if (navigator.share) {
+          await navigator.share({ title: 'Schappies', text });
+          break;
+        }
+      } catch (err) {
+        if (err?.name === 'AbortError') break;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        toast('Link gekopieerd');
+      } catch {
+        toast(`Code: ${id}`);
+      }
+      break;
+    }
+    case 'invite-revoke':
+      if (await run(() => revokeInvite(id)) !== null) toast(`Uitnodiging ${id} ingetrokken`);
+      break;
+    case 'member-remove':
+      openSheet({ mode: 'confirm-remove', title: 'Lid verwijderen', uid: id, name: memberName(id) });
+      break;
+    case 'confirm-remove': {
+      const sh = state.sheet;
+      closeSheet();
+      if (sh && (await run(() => removeMember(state.hid, state.user, sh.uid, sh.name))) !== null) toast(`${sh.name} verwijderd`);
+      break;
+    }
     case 'import-open':
       state.importDraft = { storeId: state.layoutStoreId, text: '', preview: null, replace: true, error: '' };
       render();
@@ -2220,6 +2503,19 @@ document.addEventListener('submit', async (e) => {
       console.error(err);
       renderSetup(friendlyError(err) || '');
     }
+    return;
+  }
+
+  if (kind === 'join-code') {
+    const code = normalizeCode(form.querySelector('input[name="code"]').value);
+    if (code.length !== 6) {
+      toast('Een code heeft 6 tekens');
+      return;
+    }
+    setPendingJoin(code);
+    stopWatching();
+    closeSheetSafe();
+    await showJoin(code);
     return;
   }
 

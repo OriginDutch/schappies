@@ -39,6 +39,36 @@ service cloud.firestore {
       return ownerUid == 'shared' || ownerUid == request.auth.uid;
     }
 
+    // De uitnodiging die bij deze batch hoort is (na de batch) door jou gebruikt.
+    function joinedWith(hid, code) {
+      let inv = getAfter(/databases/$(database)/documents/invites/$(code)).data;
+      return inv.hid == hid && inv.usedBy == request.auth.uid;
+    }
+
+    // Uitnodigingen. De code is het geheim: wie hem kent mag hem lezen, maar
+    // niemand kan door de lijst bladeren (alleen je eigen uitnodigingen).
+    match /invites/{code} {
+      allow get: if signedIn();
+      allow list: if signedIn() && resource.data.createdBy == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && get(householdPath(request.resource.data.hid)).data.ownerUid == request.auth.uid
+        && request.resource.data.usedBy == null
+        && request.resource.data.revoked == false;
+      // Gebruiken: één keer, niet verlopen, niet ingetrokken, alleen op je eigen naam.
+      allow update: if signedIn()
+        && resource.data.usedBy == null
+        && resource.data.revoked == false
+        && resource.data.expiresAt > request.time
+        && request.resource.data.usedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedBy', 'usedAt']);
+      // Intrekken door de maker.
+      allow update: if signedIn()
+        && resource.data.createdBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['revoked', 'revokedAt']);
+      allow delete: if false;
+    }
+
     // Eigen profiel: alleen jezelf.
     match /users/{uid} {
       allow read, write: if signedIn() && request.auth.uid == uid;
@@ -52,11 +82,31 @@ service cloud.firestore {
       allow read: if signedIn() && request.auth.uid in resource.data.members;
 
       // Leden mogen bijv. de naam aanpassen, maar eigenaar en leden niet.
-      // (Uitnodigen komt in v2 en krijgt dan een eigen regel.)
       allow update: if signedIn()
         && request.auth.uid in resource.data.members
         && request.resource.data.ownerUid == resource.data.ownerUid
         && request.resource.data.members == resource.data.members;
+
+      // Meedoen via een uitnodiging: jezelf (en alleen jezelf) achteraan toevoegen,
+      // in dezelfde batch waarin de uitnodiging op jouw naam als gebruikt wordt gezet.
+      allow update: if signedIn()
+        && !(request.auth.uid in resource.data.members)
+        && request.resource.data.members == resource.data.members.concat([request.auth.uid])
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['members', 'memberNames', 'lastJoinCode', 'updatedAt', 'updatedBy'])
+        && request.resource.data.get('memberNames', {}).diff(resource.data.get('memberNames', {}))
+             .affectedKeys().hasOnly([request.auth.uid])
+        && joinedWith(hid, request.resource.data.lastJoinCode);
+
+      // De eigenaar mag leden verwijderen (niet zichzelf).
+      allow update: if signedIn()
+        && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.auth.uid in request.resource.data.members
+        && resource.data.members.hasAll(request.resource.data.members)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['members', 'updatedAt', 'updatedBy']);
 
       allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
 

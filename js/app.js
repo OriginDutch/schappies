@@ -328,6 +328,7 @@ function render() {
   renderNav();
   renderView();
   renderAddbar();
+  syncHistory();
 }
 
 function renderNav() {
@@ -1169,17 +1170,21 @@ function viewOpties() {
 // ---------- sheet (onderin uitschuivend paneel) ----------
 
 function openSheet(sheet) {
+  // Toetsenbord van het invoerveld eronder dichtdoen, anders blijft het hangen.
+  if (document.activeElement && !document.activeElement.closest?.('#sheet-root')) document.activeElement.blur();
   state.sheet = sheet;
   renderSheet();
   document.body.classList.add('sheet-open');
   const first = document.querySelector('#sheet-root [data-autofocus]');
   if (first) setTimeout(() => first.focus(), 30);
+  syncHistory();
 }
 
 function closeSheet() {
   state.sheet = null;
   document.getElementById('sheet-root').innerHTML = '';
   document.body.classList.remove('sheet-open');
+  syncHistory();
 }
 
 function renderSheet() {
@@ -2344,6 +2349,92 @@ function registerServiceWorker() {
     });
   });
 }
+
+// ---------- terugswipen / terugknop ----------
+//
+// Elke open "laag" (sheet, import, subpagina) krijgt een eigen stap in de
+// browsergeschiedenis. Terug sluit de bovenste laag in plaats van de site te
+// verlaten. Tabbladen tellen niet mee. Staat er niks open, dan vraagt de app
+// eerst "Nog een keer terug om te sluiten".
+
+const nav = { depth: 0, skipPops: 0, guard: false, armed: false, armTimer: null };
+
+// Hoeveel lagen staan er nu open, afgeleid uit de state.
+function openDepth() {
+  let d = 0;
+  if (state.importDraft) d += state.importDraft.preview ? 2 : 1;
+  if (state.layoutStoreId || state.chainView || state.optSub) d += 1;
+  if (state.sheet) d += 1;
+  return d;
+}
+
+// Geschiedenis gelijktrekken met wat er open staat.
+function syncHistory() {
+  const want = openDepth();
+  while (nav.depth < want) {
+    history.pushState({ bs: 'layer' }, '');
+    nav.depth += 1;
+  }
+  if (nav.depth > want) {
+    nav.skipPops += 1;
+    history.go(want - nav.depth);
+    nav.depth = want;
+  }
+}
+
+// De bovenste laag sluiten, zonder zelf de geschiedenis aan te raken.
+function closeTopLayer() {
+  if (state.sheet) {
+    state.sheet = null;
+    document.getElementById('sheet-root').innerHTML = '';
+    document.body.classList.remove('sheet-open');
+    return;
+  }
+  if (state.importDraft) {
+    if (state.importDraft.preview) state.importDraft.preview = null;
+    else state.importDraft = null;
+    return;
+  }
+  state.layoutStoreId = null;
+  state.layoutNewSection = null;
+  state.chainView = null;
+  state.optSub = null;
+}
+
+// Vangnet onder alle lagen: pas na de eerste aanraking (browsers negeren
+// geschiedenisstappen die zonder interactie zijn gemaakt).
+function ensureGuard() {
+  if (nav.guard || nav.depth > 0) return;
+  history.pushState({ bs: 'guard' }, '');
+  nav.guard = true;
+}
+document.addEventListener('pointerdown', ensureGuard, true);
+document.addEventListener('keydown', ensureGuard, true);
+
+window.addEventListener('popstate', () => {
+  if (nav.skipPops > 0) {
+    nav.skipPops -= 1;
+    return;
+  }
+  if (nav.depth > 0) {
+    nav.depth -= 1;
+    closeTopLayer();
+    render();
+    return;
+  }
+  // Niks open: het vangnet is net weggehaald.
+  nav.guard = false;
+  if (nav.armed) {
+    history.back();
+    return;
+  }
+  nav.armed = true;
+  clearTimeout(nav.armTimer);
+  nav.armTimer = setTimeout(() => (nav.armed = false), 2500);
+  toast('Nog een keer terug om te sluiten');
+  history.pushState({ bs: 'guard' }, '');
+  nav.guard = true;
+});
 
 initTheme();
 registerServiceWorker();

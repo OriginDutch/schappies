@@ -1,0 +1,3 @@
+# Altijd LF-regeleindes, ook op Windows. Voorkomt CRLF-gedoe en rare diffs.
+* text=auto eol=lf
+*.png binary

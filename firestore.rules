@@ -1,0 +1,114 @@
+rules_version = '2';
+
+// Boodschappen — security rules.
+// Uitgangspunt: alles dicht, tenzij hieronder expliciet toegestaan.
+// - Alleen leden van een huishouden lezen/schrijven de data ervan.
+// - Privé-items en -lijsten (ownerUid = uid) zijn alleen voor die gebruiker.
+// - Verwijderen mag alleen de eigenaar van het huishouden (de wipe).
+//   Gewone "verwijderingen" in de app zijn een deleted-vlag, dus een update.
+// - Het activiteitenlog is alleen toevoegen: nooit aanpassen.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function householdPath(hid) {
+      return /databases/$(database)/documents/households/$(hid);
+    }
+
+    // Lezen en verwijderen: kijk naar de huidige staat.
+    function isMember(hid) {
+      return signedIn() && request.auth.uid in get(householdPath(hid)).data.members;
+    }
+
+    function isOwner(hid) {
+      return signedIn() && get(householdPath(hid)).data.ownerUid == request.auth.uid;
+    }
+
+    // Schrijven: kijk naar de staat ná de write, zodat een huishouden en
+    // de eerste lijsten/secties in één batch aangemaakt kunnen worden.
+    function isMemberAfter(hid) {
+      return signedIn() && request.auth.uid in getAfter(householdPath(hid)).data.members;
+    }
+
+    // 'shared' = voor iedereen in het huishouden, anders alleen voor die uid.
+    function visibleFor(ownerUid) {
+      return ownerUid == 'shared' || ownerUid == request.auth.uid;
+    }
+
+    // Eigen profiel: alleen jezelf.
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /households/{hid} {
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.members == [request.auth.uid];
+
+      allow read: if signedIn() && request.auth.uid in resource.data.members;
+
+      // Leden mogen bijv. de naam aanpassen, maar eigenaar en leden niet.
+      // (Uitnodigen komt in v2 en krijgt dan een eigen regel.)
+      allow update: if signedIn()
+        && request.auth.uid in resource.data.members
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.members == resource.data.members;
+
+      allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
+
+      // Lijsten en items: gedeeld of privé.
+      match /lists/{id} {
+        allow read: if isMember(hid) && visibleFor(resource.data.ownerUid);
+        allow create: if isMemberAfter(hid) && visibleFor(request.resource.data.ownerUid);
+        allow update: if isMemberAfter(hid)
+          && visibleFor(resource.data.ownerUid)
+          && visibleFor(request.resource.data.ownerUid);
+        allow delete: if isOwner(hid);
+      }
+
+      match /items/{id} {
+        allow read: if isMember(hid) && visibleFor(resource.data.ownerUid);
+        allow create: if isMemberAfter(hid) && visibleFor(request.resource.data.ownerUid);
+        allow update: if isMemberAfter(hid)
+          && visibleFor(resource.data.ownerUid)
+          && visibleFor(request.resource.data.ownerUid);
+        allow delete: if isOwner(hid);
+      }
+
+      match /products/{id} {
+        // Productgeheugen: gedeeld (s_…) of privé (u_<uid>_…).
+        allow read: if isMember(hid) && visibleFor(resource.data.ownerUid);
+        allow create: if isMemberAfter(hid) && visibleFor(request.resource.data.ownerUid);
+        allow update: if isMemberAfter(hid)
+          && visibleFor(resource.data.ownerUid)
+          && visibleFor(request.resource.data.ownerUid);
+        allow delete: if isOwner(hid);
+      }
+
+      // Activiteitenlog: toevoegen als jezelf, nooit aanpassen.
+      match /activity/{id} {
+        allow read: if isMember(hid) && visibleFor(resource.data.get('ownerUid', 'shared'));
+        allow create: if isMemberAfter(hid)
+          && request.resource.data.by == request.auth.uid
+          && visibleFor(request.resource.data.ownerUid);
+        allow update: if false;
+        allow delete: if isOwner(hid);
+      }
+
+      // Overige collecties van het huishouden (winkels, ketens, secties,
+      // rondes, suggesties): gedeeld binnen het huishouden.
+      match /{collectionName}/{id} {
+        allow read: if isMember(hid)
+          && collectionName in ['stores', 'chains', 'sections', 'trips', 'suggestions'];
+        allow create, update: if isMemberAfter(hid)
+          && collectionName in ['stores', 'chains', 'sections', 'trips', 'suggestions'];
+        allow delete: if isOwner(hid)
+          && collectionName in ['stores', 'chains', 'sections', 'trips', 'suggestions'];
+      }
+    }
+  }
+}

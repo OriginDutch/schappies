@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="nl" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Boodschappen</title>
+  <meta name="theme-color" content="#0e1013">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/app.css">
+  <script>
+    // Thema direct zetten, vóór het eerste beeld (geen witte flits).
+    try {
+      var t = localStorage.getItem('bs.theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  </script>
+  <script src="js/version.js"></script>
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <div id="app">
+    <div class="center-screen"><p class="muted">Laden…</p></div>
+  </div>
+
+  <div class="update-bar" id="update-bar" role="status" hidden>
+    <span>Nieuwe versie beschikbaar</span>
+    <button class="btn btn-primary btn-sm" data-action="apply-update">Vernieuwen</button>
+  </div>
+
+  <noscript>Deze app heeft JavaScript nodig.</noscript>
+</body>
+</html>

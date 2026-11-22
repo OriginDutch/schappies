@@ -8,6 +8,7 @@ import { db } from './firebase.js';
 import {
   doc,
   getDoc,
+  getDocFromServer,
   collection,
   query,
   where,
@@ -225,9 +226,26 @@ export async function removeMember(hid, user, memberUid, memberName) {
 export function watchHousehold(hid, onData, onError) {
   return onSnapshot(
     householdRef(hid),
-    (snap) => onData(snap.exists() ? { id: snap.id, ...snap.data() } : null),
+    (snap) => {
+      // Een lege cache (bijv. na 'gegevens wissen') zegt niets: alleen de
+      // server mag zeggen dat het huishouden echt niet bestaat.
+      if (!snap.exists() && snap.metadata.fromCache) return;
+      onData(snap.exists() ? { id: snap.id, ...snap.data() } : null);
+    },
     onError,
   );
+}
+
+// Vraagt de server direct of je bij het huishouden kunt.
+// 'ok' | 'missing' | 'denied'; gooit bij andere fouten (bijv. offline).
+export async function checkHouseholdAccess(hid) {
+  try {
+    const snap = await getDocFromServer(householdRef(hid));
+    return snap.exists() ? 'ok' : 'missing';
+  } catch (err) {
+    if (err?.code === 'permission-denied') return 'denied';
+    throw err;
+  }
 }
 
 const toDocs = (snap) => snap.docs.map((d) => ({ id: d.id, ...d.data({ serverTimestamps: 'estimate' }) }));

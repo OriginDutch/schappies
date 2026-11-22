@@ -44,6 +44,7 @@ import {
   removeMember,
   normalizeCode,
   isMemberOf,
+  checkHouseholdAccess,
   DEFAULT_SECTIONS,
 } from './data.js';
 import {
@@ -153,6 +154,31 @@ const icon = (name, size = 20) =>
 function stopWatching() {
   state.unsubs.forEach((u) => u());
   state.unsubs = [];
+  stopInvitesWatch();
+}
+
+// Uitnodigingen pas ophalen als je het ledenscherm (Opties) opent. Een
+// geweigerde listener kan de Firestore-SDK laten crashen (b815), dus deze
+// hoort niet bij het opstarten van de app.
+let invitesUnsub = null;
+function ensureInvitesWatch() {
+  if (invitesUnsub || !state.user) return;
+  invitesUnsub = watchMyInvites(
+    state.user.uid,
+    (inv) => {
+      state.invites = inv;
+      if (state.view === 'opties') render();
+    },
+    (err) => {
+      console.warn('Uitnodigingen niet beschikbaar:', err?.message);
+      // Niet opnieuw proberen tot de volgende keer dat de app start.
+    },
+  );
+}
+function stopInvitesWatch() {
+  if (invitesUnsub) invitesUnsub();
+  invitesUnsub = null;
+  state.invites = [];
 }
 
 function friendlyError(err) {
@@ -373,6 +399,21 @@ function continueWithoutJoin() {
   state.joinInvite = null;
   if (state.profile?.householdId) startHousehold(state.profile.householdId);
   else renderSetup();
+}
+
+// Server bevestigt: jij kunt niet (meer) bij dit huishouden.
+function renderNoAccess() {
+  state.mounted = false;
+  $app.innerHTML = `
+    <div class="center-screen">
+      <div class="auth-card">
+        <h1 class="auth-title">Geen toegang</h1>
+        <p class="error" role="alert">Je bent geen lid (meer) van dit huishouden, of het bestaat niet meer.</p>
+        <button class="btn btn-primary btn-block" data-action="reload">Opnieuw proberen</button>
+        <button class="btn btn-ghost btn-block" data-action="choose-household">Ander huishouden kiezen</button>
+        <button class="btn btn-ghost btn-block" data-action="logout">Uitloggen</button>
+      </div>
+    </div>`;
 }
 
 function renderError(err) {
@@ -1302,6 +1343,7 @@ function viewMembers(isOwner) {
 }
 
 function viewOpties() {
+  if (state.household?.ownerUid === state.user?.uid) ensureInvitesWatch();
   const pref = getThemePref();
   const isOwner = state.household?.ownerUid === state.user?.uid;
   const themeBtn = (val, label) =>
@@ -1803,14 +1845,31 @@ function startHousehold(hid) {
   state.mounted = false;
   renderBoot('Lijsten laden…');
 
-  const fatal = (err) => {
+  // Eén fout is genoeg: de rest van de listeners volgt vaak met dezelfde.
+  let failed = false;
+  const fatal = async (err) => {
     console.error(err);
+    if (failed || state.hid !== hid) return;
+    failed = true;
     stopWatching();
-    if (err?.code === 'permission-denied') {
-      renderSetup('Je hebt geen toegang (meer) tot je huishouden. Maak een nieuw huishouden aan of vul een uitnodigingscode in.');
+    renderBoot('Toegang controleren…');
+    if (err?.code !== 'permission-denied') {
+      renderError(err);
       return;
     }
-    renderError(err);
+    // Weigering kan ook komen doordat de rules niet bij deze versie passen.
+    // Alleen als de server zelf zegt dat je er niet bij kunt: geen toegang.
+    try {
+      const access = await checkHouseholdAccess(hid);
+      if (state.hid !== hid) return;
+      if (access === 'ok') {
+        renderError(err); // 'Geen toegang. Zijn de nieuwste security rules gedeployed?'
+      } else {
+        renderNoAccess();
+      }
+    } catch (e) {
+      renderError(e);
+    }
   };
   const got = (key) => {
     state.loaded.add(key);
@@ -1822,8 +1881,9 @@ function startHousehold(hid) {
       hid,
       (h) => {
         if (!h) {
+          // Door de server bevestigd (zie watchHousehold): bestaat niet meer.
           stopWatching();
-          renderSetup();
+          renderNoAccess();
           return;
         }
         state.household = h;
@@ -1862,15 +1922,6 @@ function startHousehold(hid) {
         renderDatalist();
       },
       fatal,
-    ),
-    // Eigen uitnodigingen (alleen voor het overzicht onder Opties).
-    watchMyInvites(
-      state.user.uid,
-      (inv) => {
-        state.invites = inv;
-        if (state.view === 'opties') render();
-      },
-      (err) => console.warn('Uitnodigingen niet beschikbaar:', err?.message),
     ),
     // Undo is een extraatje: als de index nog bouwt, werkt de rest gewoon door.
     watchActivity(
@@ -1990,6 +2041,9 @@ document.addEventListener('click', async (e) => {
       break;
     case 'reload':
       location.reload();
+      break;
+    case 'choose-household':
+      renderSetup();
       break;
 
     case 'toggle': {

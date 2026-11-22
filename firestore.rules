@@ -4,7 +4,8 @@ rules_version = '2';
 // Uitgangspunt: alles dicht, tenzij hieronder expliciet toegestaan.
 // - Alleen leden van een huishouden lezen/schrijven de data ervan.
 // - Privé-items en -lijsten (ownerUid = uid) zijn alleen voor die gebruiker.
-// - Verwijderen mag alleen de eigenaar van het huishouden (de wipe).
+// - Verwijderen mag de eigenaar van het huishouden (de wipe), en iedereen
+//   die erbij kan voor iets dat al langer dan 7 dagen in de prullenbak ligt.
 //   Gewone "verwijderingen" in de app zijn een deleted-vlag, dus een update.
 // - Het activiteitenlog is alleen toevoegen: nooit aanpassen.
 
@@ -37,6 +38,12 @@ service cloud.firestore {
     // 'shared' = voor iedereen in het huishouden, anders alleen voor die uid.
     function visibleFor(ownerUid) {
       return ownerUid == 'shared' || ownerUid == request.auth.uid;
+    }
+
+    // Ligt al langer dan 7 dagen in de prullenbak (deleted-vlag + tijdstip).
+    function trashedLongEnough() {
+      return resource.data.get('deleted', false) == true
+        && request.time > resource.data.get('deletedAt', resource.data.updatedAt) + duration.value(7, 'd');
     }
 
     // De uitnodiging die bij deze batch hoort was nog vrij, en is in déze batch
@@ -133,11 +140,23 @@ service cloud.firestore {
         allow update: if isMemberAfter(hid)
           && visibleFor(resource.data.ownerUid)
           && visibleFor(request.resource.data.ownerUid);
-        allow delete: if isOwner(hid);
+        allow delete: if isOwner(hid)
+          || (isMember(hid) && visibleFor(resource.data.ownerUid) && trashedLongEnough());
       }
 
       match /products/{id} {
         // Productgeheugen: gedeeld (s_…) of privé (u_<uid>_…).
+        allow read: if isMember(hid) && visibleFor(resource.data.ownerUid);
+        allow create: if isMemberAfter(hid) && visibleFor(request.resource.data.ownerUid);
+        allow update: if isMemberAfter(hid)
+          && visibleFor(resource.data.ownerUid)
+          && visibleFor(request.resource.data.ownerUid);
+        allow delete: if isOwner(hid)
+          || (isMember(hid) && visibleFor(resource.data.ownerUid) && trashedLongEnough());
+      }
+
+      // Rondes (historie): gedeeld of privé, net als items.
+      match /trips/{id} {
         allow read: if isMember(hid) && visibleFor(resource.data.ownerUid);
         allow create: if isMemberAfter(hid) && visibleFor(request.resource.data.ownerUid);
         allow update: if isMemberAfter(hid)
@@ -157,14 +176,19 @@ service cloud.firestore {
       }
 
       // Overige collecties van het huishouden (winkels, ketens, secties,
-      // rondes, suggesties): gedeeld binnen het huishouden.
+      // suggesties): gedeeld binnen het huishouden.
       match /{collectionName}/{id} {
         allow read: if isMember(hid)
-          && collectionName in ['stores', 'chains', 'sections', 'trips', 'suggestions'];
+          && collectionName in ['stores', 'chains', 'sections', 'suggestions'];
         allow create, update: if isMemberAfter(hid)
-          && collectionName in ['stores', 'chains', 'sections', 'trips', 'suggestions'];
-        allow delete: if isOwner(hid)
-          && collectionName in ['stores', 'chains', 'sections', 'trips', 'suggestions'];
+          && collectionName in ['stores', 'chains', 'sections', 'suggestions'];
+        // Prullenbak legen: winkels en eigen secties (standaardsecties nooit).
+        allow delete: if collectionName in ['stores', 'chains', 'sections', 'suggestions']
+          && (isOwner(hid)
+            || (isMember(hid)
+              && collectionName in ['stores', 'sections']
+              && (collectionName != 'sections' || resource.data.get('custom', false) == true)
+              && trashedLongEnough()));
       }
     }
   }

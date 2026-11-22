@@ -45,6 +45,14 @@ import {
   normalizeCode,
   isMemberOf,
   checkHouseholdAccess,
+  finishRound,
+  watchTrips,
+  commitCompound,
+  newItemDoc,
+  nowTs,
+  watchTrashItems,
+  purgeTrash,
+  tripLine,
   DEFAULT_SECTIONS,
 } from './data.js';
 import {
@@ -124,6 +132,13 @@ const state = {
   allSections: [],
   chains: [],
   chainView: null,
+  trips: [],
+  tripsReady: false,
+  openTripId: null,
+  productQuery: '',
+  allStores: [],
+  trashItems: [],
+  trashReady: false,
   migrating: false,
   sheet: null,
   mounted: false,
@@ -155,6 +170,9 @@ function stopWatching() {
   state.unsubs.forEach((u) => u());
   state.unsubs = [];
   stopInvitesWatch();
+  stopTripsWatch();
+  stopTrashWatch();
+  purgeDone = false;
 }
 
 // Uitnodigingen pas ophalen als je het ledenscherm (Opties) opent. Een
@@ -175,6 +193,57 @@ function ensureInvitesWatch() {
     },
   );
 }
+// Historie pas laden als je hem opent (scheelt reads bij elke start).
+let tripsUnsub = null;
+function ensureTripsWatch() {
+  if (tripsUnsub || !state.user || !state.hid) return;
+  tripsUnsub = watchTrips(
+    state.hid,
+    state.user.uid,
+    (trips) => {
+      state.trips = trips;
+      state.tripsReady = true;
+      if (state.view === 'historie') render();
+    },
+    (err) => {
+      console.warn('Historie niet beschikbaar:', err?.message);
+      state.tripsError = friendlyError(err);
+      if (state.view === 'historie') render();
+    },
+  );
+}
+function stopTripsWatch() {
+  if (tripsUnsub) tripsUnsub();
+  tripsUnsub = null;
+  state.trips = [];
+  state.tripsReady = false;
+  state.tripsError = null;
+}
+
+// Prullenbak: verwijderde items. Ook nodig voor het opruimen na een week.
+let trashUnsub = null;
+function ensureTrashWatch() {
+  if (trashUnsub || !state.user || !state.hid) return;
+  trashUnsub = watchTrashItems(
+    state.hid,
+    state.user.uid,
+    (items) => {
+      state.trashItems = items;
+      const first = !state.trashReady;
+      state.trashReady = true;
+      if (first) maybePurge();
+      if (state.view === 'opties') render();
+    },
+    (err) => console.warn('Prullenbak niet beschikbaar:', err?.message),
+  );
+}
+function stopTrashWatch() {
+  if (trashUnsub) trashUnsub();
+  trashUnsub = null;
+  state.trashItems = [];
+  state.trashReady = false;
+}
+
 function stopInvitesWatch() {
   if (invitesUnsub) invitesUnsub();
   invitesUnsub = null;
@@ -189,6 +258,7 @@ function friendlyError(err) {
     return `Dit domein (${location.hostname}) mag nog niet inloggen. Voeg het toe in Firebase → Authentication → Settings → Authorized domains.`;
   if (code === 'auth/network-request-failed' || code === 'unavailable') return 'Geen verbinding. Check je internet en probeer opnieuw.';
   if (code === 'permission-denied') return 'Geen toegang. Zijn de nieuwste security rules gedeployed?';
+  if (code === 'not-found') return 'Dat kan niet meer: het is definitief verwijderd (langer dan een week in de prullenbak).';
   return `Er ging iets mis (${code || err?.message || 'onbekend'}).`;
 }
 
@@ -435,6 +505,7 @@ function renderError(err) {
 const NAV = [
   { id: 'lijst', label: 'Lijst' },
   { id: 'historie', label: 'Historie' },
+  { id: 'producten', label: 'Producten' },
   { id: 'winkels', label: 'Winkels' },
   { id: 'opties', label: 'Opties' },
 ];
@@ -486,6 +557,7 @@ function render() {
     });
   }
   if (!state.mounted) mountShell();
+  ensureTrashWatch();
   renderNav();
   renderView();
   renderAddbar();
@@ -505,8 +577,11 @@ function renderView() {
   const el = document.getElementById('view');
   if (state.view === 'lijst') el.innerHTML = viewLijst();
   else if (state.view === 'winkels') el.innerHTML = viewWinkels();
-  else if (state.view === 'opties') el.innerHTML = state.optSub === 'secties' ? viewSecties() : viewOpties();
-  else el.innerHTML = viewPlaceholder('Historie', 'Rondes en producten verschijnen hier zodra rondes afronden er is.');
+  else if (state.view === 'opties')
+    el.innerHTML = state.optSub === 'secties' ? viewSecties() : state.optSub === 'prullenbak' ? viewPrullenbak() : viewOpties();
+  else if (state.view === 'historie') el.innerHTML = viewHistorie();
+  else if (state.view === 'producten') el.innerHTML = viewProducten();
+  else el.innerHTML = viewPlaceholder('', '');
   document.getElementById('main').classList.toggle('has-addbar', showAddbar());
 }
 
@@ -708,7 +783,8 @@ function viewLijst() {
       total && !open.length
         ? `<section class="card done-card">
             <h2 class="card-title">Alles gehaald bij ${esc(store?.name || '')}</h2>
-            <p class="muted">Ronde afronden en de historie komen in een volgende bouwstap.</p>
+            <p class="muted">Rond de ronde af: wat je gehaald hebt gaat naar de historie.</p>
+            <button class="btn btn-primary btn-block" data-action="finish-start">Ronde afronden</button>
           </section>`
         : ''
     }
@@ -746,7 +822,313 @@ function viewLijst() {
             ${state.cartOpen ? `<div class="cart-items">${cart.map(itemRow).join('')}</div>` : ''}
           </section>`
         : ''
+    }
+
+    ${
+      total && open.length
+        ? `<div class="finish-row">
+            <button class="btn btn-ghost btn-block" data-action="finish-start">Klaar bij ${esc(store?.name || '')}</button>
+          </div>`
+        : ''
     }`;
+}
+
+// ---------- historie ----------
+
+function formatWhen(ts) {
+  const ms = ts?.toMillis ? ts.toMillis() : Number(ts) || 0;
+  return new Date(ms).toLocaleString('nl-NL', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+const tripById = (id) => state.trips.find((t) => t.id === id) || null;
+
+function viewHistorie() {
+  ensureTripsWatch();
+  const head = `<header class="page-head"><h1 class="page-title">Historie</h1></header>`;
+  if (state.tripsError && !state.tripsReady) {
+    return `${head}<section class="card"><p class="error" role="alert">${esc(state.tripsError)}</p></section>`;
+  }
+  if (!state.tripsReady) return `${head}<p class="muted">Laden…</p>`;
+  if (!state.trips.length) {
+    return `${head}
+      <section class="card empty">
+        <h2 class="card-title">Nog geen rondes</h2>
+        <p class="muted">Rond een ronde af op je lijst ("Klaar bij …"), dan komt hij hier te staan.</p>
+      </section>`;
+  }
+  return `${head}
+    <div class="trips">
+      ${state.trips.map(tripCard).join('')}
+    </div>`;
+}
+
+function tripCard(t) {
+  const open = state.openTripId === t.id;
+  const items = t.items || [];
+  const priv = t.ownerUid !== SHARED;
+  return `
+    <section class="card trip${open ? ' is-open' : ''}">
+      <button class="trip-head" data-action="trip-toggle" data-id="${t.id}" aria-expanded="${open}">
+        <span class="trip-title">${esc(t.storeName || storeById(t.storeId)?.name || 'Winkel')}${priv ? ' <span class="tag">privé</span>' : ''}</span>
+        <span class="trip-meta muted small">${esc(formatWhen(t.finishedAt))} · ${items.length} ${items.length === 1 ? 'item' : 'items'}</span>
+        <span class="trip-chevron">${icon(open ? 'up' : 'down', 18)}</span>
+      </button>
+      ${
+        open
+          ? `<div class="trip-body">
+              <p class="muted small">Afgerond door ${esc(t.finishedByName || memberName(t.finishedBy))}</p>
+              <div class="trip-items">
+                ${items
+                  .map((line, idx) => {
+                    const qty = formatItemQty(line);
+                    return `<div class="trip-item">
+                      <div class="trip-item-main">
+                        <span class="item-name">${esc(line.name)}</span>
+                        ${qty ? `<span class="item-qty">${esc(qty)}</span>` : ''}
+                        <span class="trip-by muted small">${line.added ? 'later toegevoegd' : `✓ ${esc(line.checkedByName || memberName(line.checkedBy) || '')}`}</span>
+                      </div>
+                      <button class="btn btn-ghost btn-sm" data-action="trip-again" data-id="${t.id}" data-idx="${idx}">Nog een keer</button>
+                      <button class="icon-btn icon-btn-quiet" data-action="trip-item-edit" data-id="${t.id}" data-idx="${idx}" aria-label="${esc(line.name)} aanpassen">${icon('edit', 18)}</button>
+                    </div>`;
+                  })
+                  .join('')}
+              </div>
+              <button class="btn btn-ghost btn-sm" data-action="trip-add" data-id="${t.id}">+ Vergeten item toevoegen</button>
+            </div>`
+          : ''
+      }
+    </section>`;
+}
+
+// ---------- producten ----------
+
+function visibleProducts() {
+  return [...state.products.values()]
+    .filter((p) => !p.deleted && p.name && (p.ownerUid === SHARED || p.ownerUid === state.user.uid))
+    .sort((a, b) => a.name.localeCompare(b.name, 'nl'));
+}
+
+function productStats(p) {
+  const counts = Object.entries(p.storeCounts || {}).filter(([, n]) => n > 0);
+  const total = counts.reduce((sum, [, n]) => sum + n, 0);
+  const top = counts.sort((a, b) => b[1] - a[1])[0];
+  return {
+    total,
+    mostlyAt: top ? storeById(top[0])?.name || null : null,
+    last: p.lastBoughtAt ? formatWhen(p.lastBoughtAt) : null,
+    lastAt: p.lastBoughtStoreId ? storeById(p.lastBoughtStoreId)?.name || null : null,
+  };
+}
+
+function productRows() {
+  const q = state.productQuery.trim().toLocaleLowerCase('nl');
+  const all = visibleProducts();
+  const shown = q ? all.filter((p) => p.name.toLocaleLowerCase('nl').includes(q)) : all;
+  if (!all.length) return `<p class="muted">Nog geen producten. Alles wat je op de lijst zet, onthoudt de app hier.</p>`;
+  if (!shown.length) return `<p class="muted">Niks gevonden voor "${esc(state.productQuery)}".</p>`;
+  return shown
+    .map((p) => {
+      const st = productStats(p);
+      const meta = [storeById(p.preferredStoreId)?.name, st.total ? `${st.total}× gekocht` : null, p.recurring ? 'iedere keer' : null]
+        .filter(Boolean)
+        .join(' · ');
+      return `<button class="product-row" data-action="product-open" data-id="${esc(p.id)}">
+        <span class="product-name">${esc(p.name)}${p.ownerUid !== SHARED ? ' <span class="tag">privé</span>' : ''}</span>
+        <span class="muted small">${esc(meta)}</span>
+      </button>`;
+    })
+    .join('');
+}
+
+function viewProducten() {
+  const n = visibleProducts().length;
+  return `
+    <header class="page-head"><h1 class="page-title">Producten</h1><span class="muted mono small">${n}</span></header>
+    <div class="product-search">
+      <label class="sr-only" for="product-search">Zoeken</label>
+      <input id="product-search" class="input" type="search" data-product-search value="${esc(state.productQuery)}" placeholder="Zoeken…" autocomplete="off" autocapitalize="off">
+    </div>
+    <div class="product-list" id="product-list">${productRows()}</div>`;
+}
+
+// Per keten de sectie van dit product (zoals de app hem nu zou kiezen).
+function productChainRows(p, sh) {
+  return state.chains
+    .map((c) => {
+      const store = storesOfChain(c.id)[0];
+      if (!store) return '';
+      const current = sh.chainSections[c.id];
+      return `<div class="field">
+        <label class="field-label" for="pc-${c.id}">Sectie bij ${esc(c.name)}</label>
+        <select id="pc-${c.id}" class="input" data-product-chain="${c.id}">
+          ${sectionsForStore(store).map((sec) => `<option value="${sec.id}"${sec.id === current ? ' selected' : ''}>${esc(sec.name)}</option>`).join('')}
+        </select>
+      </div>`;
+    })
+    .join('');
+}
+
+function sheetProductEdit(sh) {
+  const p = state.products.get(sh.productId);
+  if (!p) return '<div class="sheet-body"><p class="muted">Product niet gevonden.</p></div>';
+  const st = productStats(p);
+  const general = state.sections.filter((x) => !x.chainId && !x.storeId).sort(bySectionSort);
+  return `
+    <form class="sheet-body" data-form="product">
+      <div>
+        <p class="eyebrow">product${p.ownerUid !== SHARED ? ' · privé' : ''}</p>
+        <h2 class="sheet-title">${esc(p.name)}</h2>
+      </div>
+      <dl class="rows product-stats">
+        <div class="row"><dt>Gekocht</dt><dd>${st.total ? `${st.total}×` : 'nog nooit'}</dd></div>
+        <div class="row"><dt>Laatst</dt><dd>${st.last ? `${esc(st.last)}${st.lastAt ? ` · ${esc(st.lastAt)}` : ''}` : '—'}</dd></div>
+        <div class="row"><dt>Meestal bij</dt><dd>${esc(st.mostlyAt || '—')}</dd></div>
+      </dl>
+      <label class="field">
+        <span class="field-label">Naam</span>
+        <input class="input" data-field="name" value="${esc(sh.name)}" maxlength="80" required autocapitalize="sentences">
+      </label>
+      <div class="field">
+        <label class="field-label" for="pp-store">Vaste winkel</label>
+        <select id="pp-store" class="input" data-field="preferredStoreId">
+          ${state.stores.map((x) => `<option value="${x.id}"${x.id === sh.preferredStoreId ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field">
+        <label class="field-label" for="pp-unit">Eenheid</label>
+        <select id="pp-unit" class="input" data-field="defaultUnit">
+          ${UNITS.map((u) => `<option value="${u.id}"${u.id === sh.defaultUnit ? ' selected' : ''}>${u.label}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field">
+        <label class="field-label" for="pp-section">Algemene sectie</label>
+        <select id="pp-section" class="input" data-field="generalSectionId">
+          ${general.map((x) => `<option value="${x.id}"${x.id === sh.generalSectionId ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}
+        </select>
+      </div>
+      ${productChainRows(p, sh)}
+      <label class="check-row"><input type="checkbox" data-field="recurring"${sh.recurring ? ' checked' : ''}> Iedere keer op de lijst</label>
+      ${sh.error ? `<p class="error" role="alert">${esc(sh.error)}</p>` : ''}
+      <button class="btn btn-primary btn-block" type="submit">Opslaan</button>
+      <button class="btn btn-ghost btn-block btn-danger" type="button" data-action="product-delete">Naar de prullenbak</button>
+    </form>`;
+}
+
+function openProductSheet(pid) {
+  const p = state.products.get(pid);
+  if (!p) return;
+  const chainSections = {};
+  for (const c of state.chains) {
+    const store = storesOfChain(c.id)[0];
+    if (store) chainSections[c.id] = resolveSection(p, store, p.name);
+  }
+  openSheet({
+    mode: 'product',
+    title: p.name,
+    productId: pid,
+    name: p.name,
+    preferredStoreId: storeById(p.preferredStoreId) ? p.preferredStoreId : state.stores[0]?.id || null,
+    defaultUnit: p.defaultUnit || 'st',
+    generalSectionId: generalSectionFor(p.sectionId, p.name),
+    chainSections,
+    chainTouched: {},
+    recurring: !!p.recurring,
+  });
+}
+
+// ---------- prullenbak ----------
+
+const TRASH_DAYS = 7;
+const DAY = 24 * 3600 * 1000;
+const trashedAt = (d) => toMillisSafe(d.deletedAt) || toMillisSafe(d.updatedAt) || Date.now();
+
+function trashEntries() {
+  const out = [];
+  for (const p of state.products.values()) {
+    if (p.deleted && (p.ownerUid === SHARED || p.ownerUid === state.user.uid)) {
+      out.push({ col: 'products', id: p.id, name: p.name || '?', kind: 'product', at: trashedAt(p), ownerUid: p.ownerUid });
+    }
+  }
+  for (const i of state.trashItems) {
+    out.push({ col: 'items', id: i.id, name: i.name || '?', kind: `item${storeById(i.storeId) ? ` · ${storeById(i.storeId).name}` : ''}`, at: trashedAt(i), ownerUid: i.ownerUid, doc: i });
+  }
+  for (const st of state.allStores.filter((x) => x.deleted)) {
+    out.push({ col: 'stores', id: st.id, name: st.name, kind: 'winkel', at: trashedAt(st), ownerUid: SHARED });
+  }
+  for (const sec of state.allSections.filter((x) => x.deleted && x.custom)) {
+    const chain = chainById(sec.chainId);
+    out.push({ col: 'sections', id: sec.id, name: sec.name, kind: `sectie${chain ? ` · ${chain.name}` : ''}`, at: trashedAt(sec), ownerUid: SHARED });
+  }
+  return out.sort((a, b) => b.at - a.at);
+}
+
+function viewPrullenbak() {
+  ensureTrashWatch();
+  const entries = trashEntries();
+  const left = (at) => {
+    const days = Math.ceil((at + TRASH_DAYS * DAY - Date.now()) / DAY);
+    return days <= 0 ? 'wordt opgeruimd' : days === 1 ? 'nog 1 dag' : `nog ${days} dagen`;
+  };
+  return `
+    <header class="page-head">
+      <div>
+        <button class="back-link" data-action="opt-back">${icon('back', 16)} Opties</button>
+        <h1 class="page-title">Prullenbak</h1>
+      </div>
+    </header>
+    <p class="muted">Wat je verwijdert blijft hier ${TRASH_DAYS} dagen staan. Daarna is het definitief weg, ook voor ongedaan maken.</p>
+    ${
+      !state.trashReady
+        ? '<p class="muted">Laden…</p>'
+        : entries.length
+          ? `<section class="card trash-list">
+              ${entries
+                .map(
+                  (e) => `<div class="trash-row">
+                    <div class="trash-main">
+                      <span class="product-name">${esc(e.name)}</span>
+                      <span class="muted small">${esc(e.kind)} · ${left(e.at)}</span>
+                    </div>
+                    <button class="btn btn-ghost btn-sm" data-action="trash-restore" data-col="${e.col}" data-id="${esc(e.id)}">Terugzetten</button>
+                  </div>`,
+                )
+                .join('')}
+            </section>`
+          : `<section class="card empty"><h2 class="card-title">Leeg</h2><p class="muted">Niks in de prullenbak.</p></section>`
+    }`;
+}
+
+async function restoreFromTrash(colName, id) {
+  const e = trashEntries().find((x) => x.col === colName && x.id === id);
+  if (!e) return;
+  let change;
+  if (colName === 'items') {
+    change = { col: 'items', id, before: { deleted: true, archived: true, checked: !!e.doc?.checked }, after: { deleted: false, archived: false, checked: false } };
+  } else {
+    change = { col: colName, id, before: { deleted: true }, after: { deleted: false } };
+  }
+  const label = `${e.name} teruggezet uit de prullenbak`;
+  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: e.ownerUid, changes: [change] }));
+  if (res?.actionId) toast(label, res.actionId);
+}
+
+// Eén keer per sessie: alles wat langer dan een week weg is, definitief verwijderen.
+// Een uur speling, zodat een iets verkeerde klok niet botst met de rules.
+let purgeDone = false;
+async function maybePurge() {
+  if (purgeDone || !state.trashReady || !ready()) return;
+  purgeDone = true;
+  const limit = Date.now() - TRASH_DAYS * DAY - 3600 * 1000;
+  const targets = trashEntries()
+    .filter((e) => e.at < limit)
+    .map((e) => ({ col: e.col, id: e.id }));
+  if (!targets.length) return;
+  try {
+    const n = await purgeTrash(state.hid, state.user, targets);
+    console.info(`Prullenbak: ${n} definitief verwijderd`);
+  } catch (err) {
+    console.warn('Prullenbak opruimen mislukt:', err?.message);
+  }
 }
 
 // ---------- winkels ----------
@@ -1375,6 +1757,14 @@ function viewOpties() {
     ${viewMembers(isOwner)}
 
     <section class="card">
+      <h2 class="card-title">Prullenbak</h2>
+      <button class="row-link" data-action="opt-trash">
+        <span>${state.trashReady ? `${trashEntries().length} ${trashEntries().length === 1 ? 'ding' : 'dingen'}` : 'Bekijken'} · ${TRASH_DAYS} dagen bewaard</span>
+        ${icon('next', 18)}
+      </button>
+    </section>
+
+    <section class="card">
       <h2 class="card-title">Secties</h2>
       <button class="row-link" data-action="opt-sections">
         <span>${state.sections.filter(isStandard).length} standaard · ${state.chains.length} ${state.chains.length === 1 ? 'keten' : 'ketens'}</span>
@@ -1433,7 +1823,13 @@ function renderSheet() {
         ? sheetConfirmDisable(s)
         : s.mode === 'confirm-remove'
           ? sheetConfirmRemove(s)
-          : sheetItem(s);
+          : s.mode === 'finish'
+            ? sheetFinish(s)
+            : s.mode === 'trip-item' || s.mode === 'trip-add'
+              ? sheetTripItem(s)
+              : s.mode === 'product'
+                ? sheetProductEdit(s)
+                : sheetItem(s);
   root.innerHTML = `
     <div class="sheet-overlay" data-action="sheet-close"></div>
     <div class="sheet" role="dialog" aria-modal="true" aria-label="${esc(s.title || '')}">
@@ -1508,30 +1904,9 @@ function sheetItem(s) {
         }
       </div>
 
-      <div class="field">
-        <div class="qty-head">
-          <span class="field-label">Aantal</span>
-          <span class="field-label">Eenheid</span>
-        </div>
-        ${s.parts
-          .map(
-            (p, i) => `<div class="qty-row">
-              <label class="sr-only" for="pq-${i}">Aantal${s.parts.length > 1 ? ` regel ${i + 1}` : ''}</label>
-              <input id="pq-${i}" class="input mono" data-part-qty="${i}" inputmode="decimal" value="${esc(p.qty ?? '')}" placeholder="—">
-              <label class="sr-only" for="pu-${i}">Eenheid${s.parts.length > 1 ? ` regel ${i + 1}` : ''}</label>
-              <select id="pu-${i}" class="input" data-part-unit="${i}">
-                ${UNITS.map((u) => `<option value="${u.id}"${u.id === p.unit ? ' selected' : ''}>${u.label}</option>`).join('')}
-              </select>
-              ${
-                s.parts.length > 1
-                  ? `<button type="button" class="icon-btn icon-btn-quiet" data-action="part-remove" data-id="${i}" aria-label="Regel ${i + 1} weghalen">${icon('x', 18)}</button>`
-                  : ''
-              }
-            </div>`,
-          )
-          .join('')}
-        <button type="button" class="btn btn-ghost btn-sm qty-add" data-action="part-add">+ Nog een</button>
-      </div>
+      ${qtyRows(s)}
+
+      <label class="check-row"><input type="checkbox" data-field="recurring"${s.recurring ? ' checked' : ''}> Iedere keer op de lijst <span class="muted small">(komt na afronden terug)</span></label>
 
       ${s.error ? `<p class="error" role="alert">${esc(s.error)}</p>` : ''}
 
@@ -1556,6 +1931,117 @@ function sheetConfirmDisable(s) {
       <button class="btn btn-primary btn-block" data-action="confirm-disable">Uitzetten en naar Overig</button>
       <button class="btn btn-ghost btn-block" data-action="sheet-close">Annuleren</button>
     </div>`;
+}
+
+// Ronde afronden met nog open items: per item kiezen.
+const FINISH_CHOICES = [
+  ['stay', 'Laten staan'],
+  ['forward', 'Doorsturen'],
+  ['trash', 'Weg'],
+];
+function sheetFinish(s) {
+  const store = storeById(s.storeId);
+  const others = state.stores.filter((x) => x.id !== s.storeId);
+  const nChecked = finishItems(s).checked.length;
+  return `
+    <div class="sheet-body">
+      <div>
+        <p class="eyebrow">ronde afronden</p>
+        <h2 class="sheet-title">Niet gehaald bij ${esc(store?.name || '')}</h2>
+        <p class="muted small">${nChecked ? `${nChecked} ${nChecked === 1 ? 'item gaat' : 'items gaan'} naar de historie.` : 'Je hebt niks afgevinkt, er komt geen ronde in de historie.'} Wat moet er met de rest?</p>
+      </div>
+      <div class="finish-list">
+        ${s.choices
+          .map((c) => {
+            const item = state.items.find((i) => i.id === c.itemId);
+            if (!item) return '';
+            const qty = formatItemQty(item);
+            return `<div class="finish-item">
+              <div class="finish-name">${esc(item.name)}${qty ? ` <span class="item-qty">${esc(qty)}</span>` : ''}</div>
+              <div class="seg" role="group" aria-label="${esc(item.name)}">
+                ${FINISH_CHOICES.map(
+                  ([v, label]) => `<button type="button" class="seg-btn${c.choice === v ? ' is-active' : ''}" aria-pressed="${c.choice === v}"
+                    data-action="finish-choice" data-id="${item.id}" data-choice="${v}"${v === 'forward' && !others.length ? ' disabled' : ''}>${label}</button>`,
+                ).join('')}
+              </div>
+              ${
+                c.choice === 'forward'
+                  ? `<label class="sr-only" for="fw-${item.id}">Doorsturen naar</label>
+                    <select id="fw-${item.id}" class="input" data-finish-store="${item.id}">
+                      ${others.map((o) => `<option value="${o.id}"${o.id === c.storeId ? ' selected' : ''}>→ ${esc(o.name)}</option>`).join('')}
+                    </select>`
+                  : ''
+              }
+            </div>`;
+          })
+          .join('')}
+      </div>
+      <button class="btn btn-primary btn-block" data-action="finish-confirm">Ronde afronden</button>
+      <button class="btn btn-ghost btn-block" data-action="sheet-close">Annuleren</button>
+    </div>`;
+}
+
+function qtyRows(s) {
+  return `
+    <div class="field">
+      <div class="qty-head">
+        <span class="field-label">Aantal</span>
+        <span class="field-label">Eenheid</span>
+      </div>
+      ${s.parts
+        .map(
+          (p, i) => `<div class="qty-row">
+            <label class="sr-only" for="pq-${i}">Aantal${s.parts.length > 1 ? ` regel ${i + 1}` : ''}</label>
+            <input id="pq-${i}" class="input mono" data-part-qty="${i}" inputmode="decimal" value="${esc(p.qty ?? '')}" placeholder="—">
+            <label class="sr-only" for="pu-${i}">Eenheid${s.parts.length > 1 ? ` regel ${i + 1}` : ''}</label>
+            <select id="pu-${i}" class="input" data-part-unit="${i}">
+              ${UNITS.map((u) => `<option value="${u.id}"${u.id === p.unit ? ' selected' : ''}>${u.label}</option>`).join('')}
+            </select>
+            ${
+              s.parts.length > 1
+                ? `<button type="button" class="icon-btn icon-btn-quiet" data-action="part-remove" data-id="${i}" aria-label="Regel ${i + 1} weghalen">${icon('x', 18)}</button>`
+                : ''
+            }
+          </div>`,
+        )
+        .join('')}
+      <button type="button" class="btn btn-ghost btn-sm qty-add" data-action="part-add">+ Nog een</button>
+    </div>`;
+}
+
+// Historie: een regel uit een ronde aanpassen, of een vergeten item toevoegen.
+function sheetTripItem(s) {
+  const t = tripById(s.tripId);
+  const adding = s.mode === 'trip-add';
+  return `
+    <form class="sheet-body" data-form="trip-item">
+      <div>
+        <p class="eyebrow">${esc(t?.storeName || '')} · ${esc(formatWhen(t?.finishedAt))}</p>
+        <h2 class="sheet-title">${adding ? 'Vergeten item toevoegen' : esc(s.name)}</h2>
+      </div>
+      ${
+        adding
+          ? `<label class="field">
+              <span class="field-label">Product</span>
+              <input class="input" data-field="name" value="${esc(s.name || '')}" maxlength="80" list="product-names" placeholder="Bijv. Kaas" data-autofocus autocapitalize="sentences">
+            </label>`
+          : ''
+      }
+      ${qtyRows(s)}
+      ${s.error ? `<p class="error" role="alert">${esc(s.error)}</p>` : ''}
+      <button class="btn btn-primary btn-block" type="submit">${adding ? 'Toevoegen aan deze ronde' : 'Opslaan'}</button>
+      ${
+        adding
+          ? ''
+          : s.confirmRemove
+            ? `<div class="remove-choice">
+                <p class="muted small">${esc(s.name)} uit deze ronde halen:</p>
+                <button class="btn btn-ghost btn-block" type="button" data-action="trip-remove" data-mode="back">Terug op de lijst</button>
+                <button class="btn btn-ghost btn-block btn-danger" type="button" data-action="trip-remove" data-mode="gone">Alleen uit de historie</button>
+              </div>`
+            : `<button class="btn btn-ghost btn-block btn-danger" type="button" data-action="trip-remove-ask">Uit deze ronde halen</button>`
+      }
+    </form>`;
 }
 
 function sheetConfirmRemove(s) {
@@ -1594,6 +2080,330 @@ function sheetStores() {
 
 // ---------- acties ----------
 
+// ---------- historie: acties ----------
+
+// Keuzes die Marcel nog bevestigt (zie gesprek): waar een item heen gaat dat
+// "terug op de lijst" moet, en of een later toegevoegd item meetelt in de stats.
+const TRIP_BACK_TO = 'round'; // 'round' = winkel van die ronde, 'preferred' = vaste winkel
+const COUNT_ADDED_TO_TRIP = true;
+
+function sheetParts(s) {
+  let parts = s.parts.map((p) => ({ qty: parseQtyInput(p.qty), unit: p.unit || 'st' }));
+  if (parts.length > 1) parts = parts.filter((p) => p.qty != null);
+  if (!parts.length) parts = [{ qty: null, unit: s.parts[0]?.unit || 'st' }];
+  return { qty: parts[0].qty, unit: parts[0].unit, parts: parts.length > 1 ? parts : null };
+}
+
+// Telling 'x keer gekocht bij winkel' als gewone wijziging (dus mee in undo).
+function countChange(pid, storeId, delta) {
+  const p = state.products.get(pid);
+  if (!p || !storeId) return null;
+  const before = { ...(p.storeCounts || {}) };
+  const after = { ...before, [storeId]: Math.max(0, (before[storeId] || 0) + delta) };
+  return { col: 'products', id: pid, before: { storeCounts: before }, after: { storeCounts: after } };
+}
+
+function listForTrip(t) {
+  return state.lists.find((l) => l.id === t.listId) || state.lists.find((l) => l.ownerUid === t.ownerUid) || null;
+}
+
+async function tripAgain(t, line) {
+  const list = listForTrip(t);
+  if (!list) return toast('Die lijst bestaat niet meer');
+  const key = productKey(line.name);
+  const pid = line.productId && liveProduct(line.productId)?.ownerUid === list.ownerUid ? line.productId : pidFor(list.ownerUid, key);
+  const p = liveProduct(pid);
+  const store = storeById(p?.preferredStoreId) || storeById(t.storeId) || storeById(currentStoreId());
+  if (!store) return toast('Geen winkel gevonden');
+  const dup = liveItems().find((i) => i.listId === list.id && !i.checked && i.key === key);
+  if (dup) return toast(`${dup.name} staat al op de lijst bij ${storeById(dup.storeId)?.name || 'een winkel'}`);
+  const sectionId = resolveSection(p, store, line.name);
+  const fields = {
+    name: line.name,
+    key,
+    qty: line.qty ?? null,
+    unit: line.unit || p?.defaultUnit || 'st',
+    parts: Array.isArray(line.parts) && line.parts.length > 1 ? line.parts : null,
+    storeId: store.id,
+    sectionId,
+  };
+  const extra = { generalSectionId: generalSectionFor(sectionId, line.name), extra: store.chainId ? { sectionByChain: { [store.chainId]: sectionId } } : {} };
+  const res = await run(() => addItem(state.hid, state.user, list, fields, productArg(pid, extra)));
+  if (res) toast(`${line.name} → ${store.name}`, res.actionId);
+}
+
+async function saveTripItem() {
+  const s = state.sheet;
+  const t = tripById(s.tripId);
+  if (!t) return closeSheet();
+  const items = t.items || [];
+  const { qty, unit, parts } = sheetParts(s);
+  const changes = [];
+  let label;
+
+  if (s.mode === 'trip-add') {
+    const name = capitalize(s.name || '').trim();
+    if (!name) {
+      s.error = 'Welk product?';
+      renderSheet();
+      return;
+    }
+    const list = listForTrip(t) || { ownerUid: t.ownerUid };
+    const p = productFor(list, productKey(name));
+    const line = {
+      ...tripLine({ name, qty, unit, parts, productId: p?.id || null, checkedBy: state.user.uid }, state.household?.memberNames || {}),
+      checkedAt: t.finishedAt || null,
+      added: true,
+    };
+    changes.push({ col: 'trips', id: t.id, before: { items }, after: { items: [...items, line] } });
+    if (COUNT_ADDED_TO_TRIP && p) {
+      const cc = countChange(p.id, t.storeId, 1);
+      if (cc) {
+        const newer = toMillisSafe(t.finishedAt) > toMillisSafe(p.lastBoughtAt);
+        if (newer) {
+          cc.before = { ...cc.before, lastBoughtAt: p.lastBoughtAt ?? null, lastBoughtStoreId: p.lastBoughtStoreId ?? null };
+          cc.after = { ...cc.after, lastBoughtAt: t.finishedAt, lastBoughtStoreId: t.storeId };
+        }
+        changes.push(cc);
+      }
+    }
+    label = `${name} toegevoegd aan ronde ${t.storeName}`;
+  } else {
+    const line = items[s.idx];
+    if (!line || line.name !== s.name) return closeSheet();
+    const next = { ...line, qty, unit, parts };
+    if (JSON.stringify(next) === JSON.stringify(line)) return closeSheet();
+    changes.push({ col: 'trips', id: t.id, before: { items }, after: { items: items.map((x, i) => (i === s.idx ? next : x)) } });
+    label = `${line.name} aangepast in ronde ${t.storeName}`;
+  }
+  closeSheet();
+  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: t.ownerUid, changes }));
+  if (res?.actionId) toast(label, res.actionId);
+}
+
+const toMillisSafe = (ts) => (ts?.toMillis ? ts.toMillis() : Number(ts) || 0);
+
+async function removeFromTrip(mode) {
+  const s = state.sheet;
+  const t = tripById(s.tripId);
+  const items = t?.items || [];
+  const line = items[s.idx];
+  closeSheet();
+  if (!t || !line || line.name !== s.name) return;
+  const changes = [{ col: 'trips', id: t.id, before: { items }, after: { items: items.filter((_, i) => i !== s.idx) } }];
+  const creates = [];
+  if (line.productId && (!line.added || COUNT_ADDED_TO_TRIP)) {
+    const cc = countChange(line.productId, t.storeId, -1);
+    if (cc) changes.push(cc);
+  }
+  let note = '';
+  if (mode === 'back') {
+    const list = listForTrip(t);
+    const key = productKey(line.name);
+    const dup = list && liveItems().find((i) => i.listId === list.id && !i.checked && i.key === key);
+    if (!list) note = ' (lijst bestaat niet meer)';
+    else if (dup) note = ` (stond al op de lijst)`;
+    else {
+      const p = liveProduct(line.productId);
+      const store = (TRIP_BACK_TO === 'preferred' && storeById(p?.preferredStoreId)) || storeById(t.storeId) || storeById(p?.preferredStoreId) || state.stores[0];
+      if (store) {
+        creates.push({
+          col: 'items',
+          data: newItemDoc(state.user, list, {
+            name: line.name,
+            key,
+            qty: line.qty,
+            unit: line.unit,
+            parts: line.parts,
+            storeId: store.id,
+            sectionId: resolveSection(p, store, line.name),
+          }, p ? p.id : null),
+          before: { deleted: true, archived: true },
+          after: { deleted: false, archived: false },
+        });
+        note = ` → terug op de lijst bij ${store.name}`;
+      }
+    }
+  }
+  const label = `${line.name} uit ronde ${t.storeName} gehaald${note}`;
+  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: t.ownerUid, creates, changes }));
+  if (res?.actionId) toast(label, res.actionId);
+}
+
+// ---------- producten: acties ----------
+
+// Nog te bevestigen door Marcel: hernoemen ook op de lijst doorvoeren, en of
+// open items meegaan naar de prullenbak als je het product verwijdert.
+const RENAME_OPEN_ITEMS = true;
+const TRASH_OPEN_ITEMS = false;
+
+async function saveProduct() {
+  const sh = state.sheet;
+  const p = state.products.get(sh.productId);
+  if (!p) return closeSheet();
+  const name = capitalize(sh.name || '').trim().slice(0, 80);
+  if (!name) {
+    sh.error = 'Geef het product een naam.';
+    renderSheet();
+    return;
+  }
+  const key = productKey(name);
+  if (key !== p.key) {
+    const clash = productOf(p.ownerUid, key);
+    if (clash && clash.id !== p.id) {
+      sh.error = `${clash.name} bestaat al. Kies een andere naam.`;
+      renderSheet();
+      return;
+    }
+  }
+  const after = {};
+  if (name !== p.name) Object.assign(after, { name, key });
+  if (sh.preferredStoreId && sh.preferredStoreId !== p.preferredStoreId) after.preferredStoreId = sh.preferredStoreId;
+  if (sh.defaultUnit !== (p.defaultUnit || 'st')) after.defaultUnit = sh.defaultUnit;
+  if (sh.generalSectionId && sh.generalSectionId !== generalSectionFor(p.sectionId, p.name)) after.sectionId = sh.generalSectionId;
+  if (!!sh.recurring !== !!p.recurring) after.recurring = !!sh.recurring;
+  const touched = Object.keys(sh.chainTouched).filter((c) => sh.chainTouched[c]);
+  if (touched.length) {
+    const map = { ...(p.sectionByChain || {}) };
+    for (const c of touched) map[c] = sh.chainSections[c];
+    after.sectionByChain = map;
+  }
+  if (!Object.keys(after).length) return closeSheet();
+  const before = Object.fromEntries(Object.keys(after).map((k) => [k, p[k] ?? null]));
+  const changes = [{ col: 'products', id: p.id, before, after }];
+  if (after.name && RENAME_OPEN_ITEMS) {
+    for (const i of liveItems().filter((x) => x.productId === p.id)) {
+      changes.push({ col: 'items', id: i.id, before: { name: i.name, key: i.key }, after: { name, key } });
+    }
+  }
+  closeSheet();
+  const label = after.name ? `${p.name} hernoemd naar ${name}` : `${name} aangepast`;
+  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: p.ownerUid, changes }));
+  if (res?.actionId) toast(label, res.actionId);
+}
+
+async function trashProduct() {
+  const sh = state.sheet;
+  const p = state.products.get(sh?.productId);
+  closeSheet();
+  if (!p) return;
+  const now = nowTs();
+  const changes = [{ col: 'products', id: p.id, before: { deleted: false }, after: { deleted: true, deletedAt: now } }];
+  if (TRASH_OPEN_ITEMS) {
+    for (const i of liveItems().filter((x) => x.productId === p.id)) {
+      changes.push({ col: 'items', id: i.id, before: { deleted: false, archived: false }, after: { deleted: true, archived: true, deletedAt: now } });
+    }
+  }
+  const label = `${p.name} naar de prullenbak`;
+  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: p.ownerUid, changes }));
+  if (res?.actionId) toast(label, res.actionId);
+}
+
+// Items van één winkel in één lijst, gesplitst in afgevinkt en open.
+function finishItems({ listId, storeId }) {
+  const inStore = liveItems().filter((i) => i.listId === listId && i.storeId === storeId);
+  return { checked: inStore.filter((i) => i.checked), open: inStore.filter((i) => !i.checked) };
+}
+
+function startFinish() {
+  const list = activeList();
+  const storeId = currentStoreId();
+  if (!list || !storeId) return;
+  const { checked, open } = finishItems({ listId: list.id, storeId });
+  if (!checked.length && !open.length) return;
+  if (!open.length) {
+    doFinish(list.id, storeId, []);
+    return;
+  }
+  const firstOther = state.stores.find((x) => x.id !== storeId)?.id || null;
+  openSheet({
+    mode: 'finish',
+    title: 'Ronde afronden',
+    listId: list.id,
+    storeId,
+    choices: open.map((i) => ({ itemId: i.id, choice: 'stay', storeId: firstOther })),
+  });
+}
+
+async function doFinish(listId, storeId, choices) {
+  const list = state.lists.find((l) => l.id === listId);
+  const store = storeById(storeId);
+  if (!list || !store) return;
+  const { checked, open } = finishItems({ listId, storeId });
+  const byId = new Map(choices.map((c) => [c.itemId, c]));
+
+  const openChoices = open.map((item) => {
+    const c = byId.get(item.id) || { choice: 'stay' };
+    if (c.choice !== 'forward') return { item, choice: c.choice };
+    const to = storeById(c.storeId);
+    if (!to) return { item, choice: 'stay' };
+    const product = state.products.get(item.productId) || null;
+    return { item, choice: 'forward', storeId: to.id, sectionId: resolveSection(product, to, item.name) };
+  });
+
+  // 'Iedere keer': direct weer op de lijst, bij de vaste winkel van het product.
+  // Niet dubbel: als hetzelfde product nog open op de lijst blijft, niets toevoegen.
+  const staysOpen = new Set(
+    liveItems()
+      .filter((i) => i.listId === listId && !i.checked)
+      .filter((i) => {
+        const oc = openChoices.find((o) => o.item.id === i.id);
+        return !oc || oc.choice !== 'trash';
+      })
+      .map((i) => i.key),
+  );
+  const recurring = [];
+  for (const i of checked) {
+    const p = state.products.get(i.productId);
+    if (!p?.recurring || p.deleted || staysOpen.has(i.key)) continue;
+    staysOpen.add(i.key);
+    const target = storeById(p.preferredStoreId) || store;
+    recurring.push({
+      productId: i.productId,
+      fields: {
+        name: i.name,
+        key: i.key,
+        qty: i.qty ?? null,
+        unit: i.unit || 'st',
+        parts: Array.isArray(i.parts) && i.parts.length > 1 ? i.parts : null,
+        storeId: target.id,
+        sectionId: resolveSection(p, target, i.name),
+      },
+    });
+  }
+
+  const seen = new Set();
+  const products = [];
+  for (const i of checked) {
+    const p = state.products.get(i.productId);
+    if (!p || seen.has(p.id)) continue;
+    seen.add(p.id);
+    products.push({ id: p.id, before: { lastBoughtAt: p.lastBoughtAt ?? null, lastBoughtStoreId: p.lastBoughtStoreId ?? null } });
+  }
+
+  const res = await run(() =>
+    finishRound(state.hid, state.user, {
+      list,
+      store,
+      checked,
+      open: openChoices,
+      recurring,
+      products,
+      names: state.household?.memberNames || {},
+    }),
+  );
+  if (!res?.actionId) return;
+  state.cartOpen = false;
+  const parts = [];
+  if (checked.length) parts.push(`${checked.length} naar de historie`);
+  const fw = openChoices.filter((o) => o.choice === 'forward').length;
+  const tr = openChoices.filter((o) => o.choice === 'trash').length;
+  if (fw) parts.push(`${fw} doorgestuurd`);
+  if (tr) parts.push(`${tr} weg`);
+  if (recurring.length) parts.push(`${recurring.length} weer op de lijst`);
+  toast(`Ronde ${store.name} afgerond${parts.length ? ` · ${parts.join(', ')}` : ''}`, res.actionId);
+}
+
 async function createStore(name, chainId = null) {
   const clean = capitalize(name).slice(0, 40);
   if (!clean) return null;
@@ -1613,11 +2423,43 @@ async function createStore(name, chainId = null) {
   return res?.storeId || null;
 }
 
-function productFor(list, key) {
-  const own = state.products.get(productIdFor(list.ownerUid, key));
-  if (own) return own;
-  if (list.ownerUid !== SHARED) return state.products.get(productIdFor(SHARED, key)) || null;
+// Een product in de prullenbak telt als onbekend: het wordt opnieuw geleerd.
+const liveProduct = (id) => {
+  const p = state.products.get(id);
+  return p && !p.deleted ? p : null;
+};
+
+// Product van één eigenaar op sleutel. Normaal is het id afgeleid van de
+// sleutel, maar na hernoemen niet meer: dan zoeken op het key-veld.
+function productOf(ownerUid, key) {
+  const direct = liveProduct(productIdFor(ownerUid, key));
+  if (direct && (direct.key || key) === key) return direct;
+  for (const p of state.products.values()) {
+    if (!p.deleted && p.ownerUid === ownerUid && p.key === key) return p;
+  }
   return null;
+}
+
+function productFor(list, key) {
+  return productOf(list.ownerUid, key) || (list.ownerUid !== SHARED ? productOf(SHARED, key) : null);
+}
+
+// Id voor een product: het bestaande (ook in de prullenbak), of een nieuw id.
+// Is het standaard-id al bezet door een hernoemd product, dan een uniek id.
+function pidFor(ownerUid, key) {
+  const live = productOf(ownerUid, key);
+  if (live) return live.id;
+  const base = productIdFor(ownerUid, key);
+  const taken = state.products.get(base);
+  if (!taken || taken.deleted || (taken.key || key) === key) return base;
+  return `${base}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+// Meegeven aan addItem: nieuw product, of een verwijderd product dat opnieuw begint.
+function productArg(pid, extra = {}) {
+  const existing = state.products.get(pid);
+  if (existing && !existing.deleted) return { id: pid, isNew: false };
+  return { id: pid, isNew: true, reset: !!existing, ...extra };
 }
 
 async function quickAdd(text) {
@@ -1637,7 +2479,7 @@ async function quickAdd(text) {
   if (known && (known.sectionId || known.sectionByStore || known.sectionByChain)) {
     const storeId = (storeById(known.preferredStoreId) && known.preferredStoreId) || activeStore;
     const sectionId = resolveSection(known, storeById(storeId), name);
-    const pid = productIdFor(list.ownerUid, key);
+    const pid = pidFor(list.ownerUid, key);
     const fields = {
       name: known.name || name,
       key,
@@ -1646,7 +2488,7 @@ async function quickAdd(text) {
       storeId,
       sectionId,
     };
-    const res = await run(() => addItem(state.hid, state.user, list, fields, { id: pid, isNew: !state.products.has(pid) }));
+    const res = await run(() => addItem(state.hid, state.user, list, fields, productArg(pid)));
     if (res) {
       const where = storeId !== activeStore ? ` → ${storeById(storeId)?.name}` : ' toegevoegd';
       toast(`${fields.name}${where}`, res.actionId);
@@ -1683,21 +2525,17 @@ async function saveSheetItem() {
     return;
   }
   // Meerdere regels: lege regels vallen weg; één regel = gewoon aantal + eenheid.
-  let parts = s.parts.map((p) => ({ qty: parseQtyInput(p.qty), unit: p.unit || 'st' }));
-  if (parts.length > 1) parts = parts.filter((p) => p.qty != null);
-  if (!parts.length) parts = [{ qty: null, unit: s.parts[0]?.unit || 'st' }];
-  const qty = parts[0].qty;
-  const unit = parts[0].unit;
-  const multi = parts.length > 1 ? parts : null;
+  const { qty, unit, parts: multi } = sheetParts(s);
 
   if (s.mode === 'item-new') {
-    const pid = productIdFor(list.ownerUid, s.key);
+    const pid = pidFor(list.ownerUid, s.key);
     const fields = { name: s.name, key: s.key, qty, unit, parts: multi, storeId: s.storeId, sectionId: s.sectionId };
     const store = storeById(s.storeId);
     const generalSectionId = generalSectionFor(s.sectionId, s.name);
     const extra = store?.chainId ? { sectionByChain: { [store.chainId]: s.sectionId } } : {};
+    if (s.recurring) extra.recurring = true;
     closeSheet();
-    const res = await run(() => addItem(state.hid, state.user, list, fields, { id: pid, isNew: true, generalSectionId, extra }));
+    const res = await run(() => addItem(state.hid, state.user, list, fields, productArg(pid, { generalSectionId, extra })));
     if (res) toast(`${s.name} → ${storeById(s.storeId)?.name}`, res.actionId);
     return;
   }
@@ -1712,14 +2550,13 @@ async function saveSheetItem() {
   }
   const key = productKey(name);
   const next = { name, key, qty, unit, parts: multi, storeId: s.storeId, sectionId: s.sectionId };
-  if (key !== item.key) next.productId = productIdFor(item.ownerUid, key);
+  if (key !== item.key) next.productId = pidFor(item.ownerUid, key);
   const same = (x, y) => JSON.stringify(x ?? null) === JSON.stringify(y ?? null);
   const changes = Object.fromEntries(Object.entries(next).filter(([k, v]) => !same(item[k], v)));
   closeSheet();
-  if (!Object.keys(changes).length) return;
 
   // Geheugen corrigeren: sectie en eenheid gelden voortaan voor dit product.
-  const pid = changes.productId || item.productId || productIdFor(item.ownerUid, key);
+  const pid = changes.productId || item.productId || pidFor(item.ownerUid, key);
   let productUpdates = null;
   if (changes.productId || s.sectionTouched || changes.unit || changes.name) {
     const data = { name, key, defaultUnit: next.unit };
@@ -1732,6 +2569,12 @@ async function saveSheetItem() {
     productUpdates = { id: pid, data };
   }
   if (!item.productId && !changes.productId) changes.productId = pid;
+  const wasRecurring = !!state.products.get(pid)?.recurring;
+  if (!!s.recurring !== wasRecurring) {
+    productUpdates ||= { id: pid, data: { name, key } };
+    productUpdates.data.recurring = !!s.recurring;
+  }
+  if (!Object.keys(changes).length && !productUpdates) return;
 
   const actionId = await run(() => updateItem(state.hid, state.user, item, changes, productUpdates));
   if (actionId) {
@@ -1792,7 +2635,8 @@ async function removeSection(sec) {
   // Items gaan naar de categorie waar de sectie onder viel (of Overig).
   const target = (sec.custom && sectionByKey(sec.parentKey)) || fallbackSection();
   const moved = itemsInSection(sec.id);
-  const changes = [{ col: 'sections', id: sec.id, before: { deleted: false }, after: { deleted: true } }];
+  const after = sec.custom ? { deleted: true, deletedAt: nowTs() } : { deleted: true };
+  const changes = [{ col: 'sections', id: sec.id, before: { deleted: false }, after }];
   for (const i of moved) changes.push({ col: 'items', id: i.id, before: { sectionId: sec.id }, after: { sectionId: target.id } });
   const label = `${sec.name} ${isStandard(sec) ? 'verborgen' : 'verwijderd'}${moved.length ? ` (${moved.length} naar ${target.name})` : ''}`;
   const actionId = await run(() => applyChanges(state.hid, state.user, { type: 'compound', label, changes }));
@@ -1910,7 +2754,15 @@ function startHousehold(hid) {
       },
       fatal,
     ),
-    watchStores(hid, (s) => ((state.stores = s), got('stores')), fatal),
+    watchStores(
+      hid,
+      (s) => {
+        state.allStores = s;
+        state.stores = s.filter((x) => !x.deleted);
+        got('stores');
+      },
+      fatal,
+    ),
     watchChains(hid, (c) => ((state.chains = c), got('chains')), fatal),
     watchItems(hid, state.user.uid, (items) => ((state.items = items), got('items')), fatal),
     watchProducts(
@@ -2067,7 +2919,71 @@ document.addEventListener('click', async (e) => {
             : [{ qty: item.qty ?? '', unit: item.unit || 'st' }],
         storeId: item.storeId,
         sectionId: displaySection(storeById(item.storeId), item.sectionId)?.id || fallbackSection()?.id,
+        recurring: !!state.products.get(item.productId)?.recurring,
       });
+      break;
+    }
+    case 'product-open':
+      openProductSheet(id);
+      break;
+    case 'product-delete':
+      await trashProduct();
+      break;
+    case 'trip-toggle':
+      state.openTripId = state.openTripId === id ? null : id;
+      render();
+      break;
+    case 'trip-again': {
+      const t = tripById(id);
+      const line = t?.items?.[Number(el.dataset.idx)];
+      if (line) await tripAgain(t, line);
+      break;
+    }
+    case 'trip-item-edit': {
+      const t = tripById(id);
+      const idx = Number(el.dataset.idx);
+      const line = t?.items?.[idx];
+      if (!line) break;
+      openSheet({
+        mode: 'trip-item',
+        title: `${line.name} aanpassen`,
+        tripId: t.id,
+        idx,
+        name: line.name,
+        parts:
+          Array.isArray(line.parts) && line.parts.length > 1
+            ? line.parts.map((p) => ({ qty: p.qty ?? '', unit: p.unit || 'st' }))
+            : [{ qty: line.qty ?? '', unit: line.unit || 'st' }],
+      });
+      break;
+    }
+    case 'trip-add':
+      openSheet({ mode: 'trip-add', title: 'Vergeten item toevoegen', tripId: id, name: '', parts: [{ qty: '', unit: 'st' }] });
+      break;
+    case 'trip-remove-ask':
+      if (state.sheet) {
+        state.sheet.confirmRemove = true;
+        renderSheet();
+      }
+      break;
+    case 'trip-remove':
+      await removeFromTrip(el.dataset.mode);
+      break;
+    case 'finish-start':
+      startFinish();
+      break;
+    case 'finish-choice': {
+      const c = state.sheet?.choices?.find((x) => x.itemId === id);
+      if (!c) break;
+      c.choice = el.dataset.choice;
+      renderSheet();
+      break;
+    }
+    case 'finish-confirm': {
+      const sh = state.sheet;
+      if (!sh || sh.mode !== 'finish') break;
+      closeSheet();
+      await doFinish(sh.listId, sh.storeId, sh.choices);
       break;
     }
     case 'toggle-cart':
@@ -2171,6 +3087,14 @@ document.addEventListener('click', async (e) => {
     case 'layout-new-section-cancel':
       state.layoutNewSection = null;
       render();
+      break;
+    case 'opt-trash':
+      state.optSub = 'prullenbak';
+      render();
+      window.scrollTo(0, 0);
+      break;
+    case 'trash-restore':
+      await restoreFromTrash(el.dataset.col, id);
       break;
     case 'opt-sections':
       state.optSub = 'secties';
@@ -2398,7 +3322,7 @@ document.addEventListener('click', async (e) => {
         toast(`Er staan nog ${open} items bij ${store.name}. Verplaats of verwijder die eerst.`);
         break;
       }
-      const actionId = await run(() => updateStore(state.hid, state.user, store, { deleted: true }, `Winkel ${store.name} verwijderd`));
+      const actionId = await run(() => updateStore(state.hid, state.user, store, { deleted: true, deletedAt: nowTs() }, `Winkel ${store.name} verwijderd`));
       if (actionId) toast(`${store.name} verwijderd`, actionId);
       break;
     }
@@ -2420,6 +3344,17 @@ document.addEventListener('change', async (e) => {
     return;
   }
 
+  if (t.dataset.productChain && state.sheet?.mode === 'product') {
+    state.sheet.chainSections[t.dataset.productChain] = t.value;
+    state.sheet.chainTouched[t.dataset.productChain] = true;
+    return;
+  }
+  if (t.dataset.finishStore && state.sheet?.mode === 'finish') {
+    const c = state.sheet.choices.find((x) => x.itemId === t.dataset.finishStore);
+    if (c) c.storeId = t.value;
+    return;
+  }
+
   if (t.dataset.partUnit !== undefined && state.sheet?.parts) {
     state.sheet.parts[Number(t.dataset.partUnit)].unit = t.value;
     return;
@@ -2435,6 +3370,10 @@ document.addEventListener('change', async (e) => {
       state.sheet.sectionId = t.value;
       state.sheet.sectionTouched = true;
     }
+    return;
+  }
+  if (state.sheet && t.dataset.field === 'recurring') {
+    state.sheet.recurring = t.checked;
     return;
   }
   if (state.sheet && t.dataset.field === 'newSectionOnlyStore') {
@@ -2558,6 +3497,12 @@ document.addEventListener('change', async (e) => {
 });
 
 document.addEventListener('input', (e) => {
+  if (e.target.dataset?.productSearch !== undefined) {
+    state.productQuery = e.target.value;
+    const box = document.getElementById('product-list');
+    if (box) box.innerHTML = productRows();
+    return;
+  }
   if (e.target.dataset?.partQty !== undefined && state.sheet?.parts) {
     state.sheet.parts[Number(e.target.dataset.partQty)].qty = e.target.value;
     return;
@@ -2567,7 +3512,7 @@ document.addEventListener('input', (e) => {
     return;
   }
   const field = e.target.dataset?.field;
-  if (field === 'sectionId' || field === 'newSectionOnlyStore') return;
+  if (field === 'sectionId' || field === 'newSectionOnlyStore' || field === 'recurring') return;
   if (field && state.sheet) state.sheet[field] = e.target.value;
 });
 
@@ -2705,6 +3650,12 @@ document.addEventListener('submit', async (e) => {
 
   if (kind === 'item') {
     await saveSheetItem();
+  }
+  if (kind === 'trip-item') {
+    await saveTripItem();
+  }
+  if (kind === 'product') {
+    await saveProduct();
   }
 });
 

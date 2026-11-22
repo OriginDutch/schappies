@@ -218,7 +218,7 @@ button {
   bottom: 0;
   z-index: 10;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   background: var(--bg);
   border-top: 1px solid var(--divider);
   padding-bottom: env(safe-area-inset-bottom);
@@ -698,6 +698,191 @@ select.input {
 
 .done-card {
   border-color: var(--accent);
+}
+
+.done-card .btn {
+  margin-top: 12px;
+}
+
+.finish-row {
+  margin-top: 16px;
+}
+
+/* ---------- historie ---------- */
+
+.trips {
+  display: grid;
+  gap: 10px;
+}
+
+.trip {
+  padding: 0;
+}
+
+.trip-head {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: 'title chev' 'meta chev';
+  gap: 2px 12px;
+  align-items: center;
+  text-align: left;
+  padding: 14px 16px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+}
+
+.trip-title {
+  grid-area: title;
+  font-weight: 700;
+}
+
+.trip-meta {
+  grid-area: meta;
+}
+
+.trip-chevron {
+  grid-area: chev;
+  color: var(--muted);
+}
+
+.trip-body {
+  display: grid;
+  gap: 10px;
+  padding: 0 16px 14px;
+}
+
+.trip-items {
+  display: grid;
+}
+
+.trip-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 48px;
+  border-top: 1px solid var(--divider);
+}
+
+.trip-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+
+.trip-by {
+  flex-basis: 100%;
+}
+
+.tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  vertical-align: middle;
+}
+
+.remove-choice {
+  display: grid;
+  gap: 8px;
+}
+
+/* ---------- producten ---------- */
+
+.product-search {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg);
+  padding: 4px 0 10px;
+}
+
+.product-list {
+  display: grid;
+}
+
+.product-row {
+  display: grid;
+  gap: 2px;
+  text-align: left;
+  min-height: 56px;
+  padding: 10px 4px;
+  border: none;
+  border-top: 1px solid var(--divider);
+  background: transparent;
+  color: var(--text);
+}
+
+.product-name {
+  font-weight: 600;
+}
+
+.product-stats {
+  margin: 0;
+}
+
+.trash-list {
+  padding: 4px 16px;
+}
+
+.trash-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 56px;
+  border-top: 1px solid var(--divider);
+}
+
+.trash-row:first-child {
+  border-top: none;
+}
+
+.trash-main {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+/* ---------- ronde afronden ---------- */
+
+.finish-list {
+  display: grid;
+  gap: 14px;
+  max-height: 55vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.finish-item {
+  display: grid;
+  gap: 8px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.finish-item:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.finish-name {
+  font-weight: 600;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.seg-btn:disabled {
+  opacity: 0.4;
 }
 
 /* ---------- toevoegbalk ---------- */

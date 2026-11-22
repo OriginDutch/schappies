@@ -342,17 +342,29 @@ export async function migrateToChains(hid, user, { stores, sections, guessParent
   return writes;
 }
 
+// Alle winkels, ook die in de prullenbak (de app filtert zelf).
 export function watchStores(hid, onData, onError) {
   return onSnapshot(
     col(hid, 'stores'),
-    (snap) =>
-      onData(
-        toDocs(snap)
-          .filter((s) => !s.deleted)
-          .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.name.localeCompare(b.name, 'nl')),
-      ),
+    (snap) => onData(toDocs(snap).sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.name.localeCompare(b.name, 'nl'))),
     onError,
   );
+}
+
+// Verwijderde items (prullenbak). Alleen geladen als dat nodig is.
+export function watchTrashItems(hid, uid, onData, onError) {
+  return watchVisible(col(hid, 'items'), uid, [where('deleted', '==', true)], onData, onError);
+}
+
+// Definitief verwijderen wat langer dan een week in de prullenbak ligt.
+// De rules controleren zelf ook of het echt een week is.
+export async function purgeTrash(hid, user, targets) {
+  if (!targets.length) return 0;
+  const batch = writeBatch(db);
+  for (const t of targets.slice(0, 400)) batch.delete(ref(hid, t.col, t.id));
+  logAction(batch, hid, user, { type: 'trash.purge', label: `Prullenbak: ${Math.min(targets.length, 400)} definitief verwijderd` });
+  await batch.commit();
+  return Math.min(targets.length, 400);
 }
 
 // Alleen actieve items (open + in de kar). Gearchiveerde/verwijderde items
@@ -527,6 +539,7 @@ export async function addItem(hid, user, list, fields, product) {
   };
   if (product.isNew) {
     Object.assign(productData, {
+      deleted: false,
       // Algemene sectie (geldt overal) + waar het in déze winkel ligt.
       sectionId: product.generalSectionId || fields.sectionId,
       ...(product.extra || {}),
@@ -535,7 +548,8 @@ export async function addItem(hid, user, list, fields, product) {
       createdAt: serverTimestamp(),
     });
   }
-  batch.set(ref(hid, 'products', product.id), productData, { merge: true });
+  // reset: product lag in de prullenbak (of is vergeten) → helemaal opnieuw leren.
+  batch.set(ref(hid, 'products', product.id), productData, product.reset ? {} : { merge: true });
 
   const actionId = logAction(batch, hid, user, {
     type: 'item.add',
@@ -621,6 +635,7 @@ export async function deleteItem(hid, user, item) {
   batch.update(ref(hid, 'items', item.id), {
     deleted: true,
     archived: true,
+    deletedAt: Timestamp.fromMillis(Date.now()),
     updatedAt: serverTimestamp(),
     updatedBy: user.uid,
   });
@@ -634,6 +649,171 @@ export async function deleteItem(hid, user, item) {
   });
   await batch.commit();
   return actionId;
+}
+
+// ---------- rondes ----------
+
+// Een ronde afronden bij één winkel, voor één lijst. Alles in één batch en
+// één regel in het log, dus in één keer ongedaan te maken.
+// checked: afgevinkte items → naar de historie (archived + tripId).
+// open: [{ item, choice: 'stay'|'forward'|'trash', storeId, sectionId }]
+// recurring: [{ fields }] → nieuwe items voor 'iedere keer'-producten.
+// products: [{ id, before }] → lastBoughtAt/lastBoughtStoreId bijwerken.
+export async function finishRound(hid, user, { list, store, checked, open, recurring, products, names }) {
+  const batch = writeBatch(db);
+  const now = Timestamp.fromMillis(Date.now());
+  const changes = [];
+  let tripId = null;
+
+  if (checked.length) {
+    const tRef = doc(col(hid, 'trips'));
+    tripId = tRef.id;
+    batch.set(tRef, {
+      schemaVersion: SCHEMA_VERSION,
+      ownerUid: list.ownerUid,
+      listId: list.id,
+      listName: list.name,
+      storeId: store.id,
+      storeName: store.name,
+      chainId: store.chainId || null,
+      finishedAt: now,
+      finishedBy: user.uid,
+      finishedByName: user.displayName || '',
+      items: checked.map((i) => tripLine(i, names)),
+      deleted: false,
+      createdAt: serverTimestamp(),
+      createdBy: user.uid,
+    });
+    changes.push({ col: 'trips', id: tRef.id, before: { deleted: true }, after: { deleted: false } });
+    for (const i of checked) {
+      const after = { archived: true, tripId: tRef.id };
+      batch.update(ref(hid, 'items', i.id), { ...after, updatedAt: serverTimestamp(), updatedBy: user.uid });
+      changes.push({ col: 'items', id: i.id, before: { archived: false, tripId: null }, after });
+    }
+  }
+
+  for (const o of open) {
+    let before = null;
+    let after = null;
+    if (o.choice === 'forward' && o.storeId && o.storeId !== o.item.storeId) {
+      before = { storeId: o.item.storeId, sectionId: o.item.sectionId ?? null };
+      after = { storeId: o.storeId, sectionId: o.sectionId ?? null };
+      if (o.item.productId) {
+        applyProductEffect(batch, hid, {
+          productId: o.item.productId,
+          path: ['forwardStats', `${o.item.storeId}__${o.storeId}`],
+          delta: 1,
+        });
+      }
+    } else if (o.choice === 'trash') {
+      before = { deleted: false, archived: false };
+      after = { deleted: true, archived: true, deletedAt: now };
+    }
+    if (!after) continue;
+    batch.update(ref(hid, 'items', o.item.id), { ...after, updatedAt: serverTimestamp(), updatedBy: user.uid });
+    changes.push({ col: 'items', id: o.item.id, before, after });
+  }
+
+  for (const r of recurring) {
+    const iRef = doc(col(hid, 'items'));
+    batch.set(iRef, newItemDoc(user, list, r.fields, r.productId));
+    changes.push({ col: 'items', id: iRef.id, before: { deleted: true, archived: true }, after: { deleted: false, archived: false } });
+  }
+
+  for (const p of products) {
+    const after = { lastBoughtAt: now, lastBoughtStoreId: store.id };
+    batch.update(ref(hid, 'products', p.id), { ...after, updatedAt: serverTimestamp() });
+    changes.push({ col: 'products', id: p.id, before: p.before, after });
+  }
+
+  if (!changes.length) return { tripId: null, actionId: null };
+  const actionId = logAction(batch, hid, user, {
+    type: 'compound',
+    label: `Ronde ${store.name} afgerond`,
+    ownerUid: list.ownerUid,
+    changes,
+  });
+  await batch.commit();
+  return { tripId, actionId };
+}
+
+// Kopie van een item zoals het in de historie komt. names: uid → naam.
+export function tripLine(i, names = {}) {
+  return {
+    itemId: i.id || null,
+    productId: i.productId || null,
+    name: i.name,
+    qty: i.qty ?? null,
+    unit: i.unit || null,
+    parts: Array.isArray(i.parts) && i.parts.length > 1 ? i.parts : null,
+    checkedBy: i.checkedBy || null,
+    checkedByName: (i.checkedBy && names[i.checkedBy]) || '',
+    checkedAt: i.checkedAt && typeof i.checkedAt.toMillis === 'function' ? Timestamp.fromMillis(i.checkedAt.toMillis()) : null,
+  };
+}
+
+function newItemDoc(user, list, fields, productId) {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    name: fields.name,
+    key: fields.key,
+    productId: productId || null,
+    qty: fields.qty ?? null,
+    unit: fields.unit || 'st',
+    parts: fields.parts || null,
+    listId: list.id,
+    ownerUid: list.ownerUid,
+    storeId: fields.storeId,
+    sectionId: fields.sectionId ?? null,
+    checked: false,
+    checkedAt: null,
+    checkedBy: null,
+    archived: false,
+    deleted: false,
+    createdAt: serverTimestamp(),
+    createdBy: user.uid,
+    updatedAt: serverTimestamp(),
+    updatedBy: user.uid,
+  };
+}
+
+// Algemene samengestelde wijziging met nieuwe documenten erbij.
+// creates: [{ col, data, before, after }] — data is het volledige nieuwe document;
+//   before/after zijn de velden die undo omzet (bijv. deleted true/false).
+// changes: [{ col, id, before, after }] — gewone updates.
+export async function commitCompound(hid, user, { label, ownerUid = SHARED, creates = [], changes = [] }) {
+  const batch = writeBatch(db);
+  const all = [];
+  const ids = [];
+  for (const c of creates) {
+    const dRef = doc(col(hid, c.col));
+    ids.push(dRef.id);
+    batch.set(dRef, { schemaVersion: SCHEMA_VERSION, ...c.data, createdAt: serverTimestamp(), createdBy: user.uid, updatedAt: serverTimestamp(), updatedBy: user.uid });
+    all.push({ col: c.col, id: dRef.id, before: c.before, after: c.after });
+  }
+  for (const c of changes) {
+    batch.update(ref(hid, c.col, c.id), { ...c.after, updatedAt: serverTimestamp(), updatedBy: user.uid });
+    all.push({ col: c.col, id: c.id, before: c.before, after: c.after });
+  }
+  if (!all.length) return { actionId: null, ids };
+  const actionId = logAction(batch, hid, user, { type: 'compound', label, ownerUid, changes: all });
+  await batch.commit();
+  return { actionId, ids };
+}
+
+export { newItemDoc };
+
+export const nowTs = () => Timestamp.fromMillis(Date.now());
+
+// Rondes (historie). Wordt pas geladen als je de Historie opent.
+export function watchTrips(hid, uid, onData, onError) {
+  return watchVisible(
+    col(hid, 'trips'),
+    uid,
+    [],
+    (docs) => onData(docs.filter((t) => !t.deleted).sort((a, b) => toMillis(b.finishedAt) - toMillis(a.finishedAt))),
+    onError,
+  );
 }
 
 // ---------- samengestelde wijzigingen ----------

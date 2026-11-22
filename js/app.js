@@ -52,7 +52,7 @@ import {
   productKey,
   guessSectionKey,
   guessParentKey,
-  formatQty,
+  formatItemQty,
   capitalize,
   parseLayoutText,
   nameSimilarity,
@@ -528,7 +528,7 @@ function latestUndoable() {
 }
 
 function itemRow(item) {
-  const qty = formatQty(item.qty, item.unit);
+  const qty = formatItemQty(item);
   return `
     <div class="item${item.checked ? ' is-checked' : ''}">
       <button class="item-main" data-action="toggle" data-id="${item.id}"
@@ -1466,17 +1466,29 @@ function sheetItem(s) {
         }
       </div>
 
-      <div class="field-row">
-        <label class="field">
+      <div class="field">
+        <div class="qty-head">
           <span class="field-label">Aantal</span>
-          <input class="input mono" data-field="qty" inputmode="decimal" value="${esc(s.qty ?? '')}" placeholder="—">
-        </label>
-        <label class="field">
           <span class="field-label">Eenheid</span>
-          <select class="input" data-field="unit">
-            ${UNITS.map((u) => `<option value="${u.id}"${u.id === s.unit ? ' selected' : ''}>${u.label}</option>`).join('')}
-          </select>
-        </label>
+        </div>
+        ${s.parts
+          .map(
+            (p, i) => `<div class="qty-row">
+              <label class="sr-only" for="pq-${i}">Aantal${s.parts.length > 1 ? ` regel ${i + 1}` : ''}</label>
+              <input id="pq-${i}" class="input mono" data-part-qty="${i}" inputmode="decimal" value="${esc(p.qty ?? '')}" placeholder="—">
+              <label class="sr-only" for="pu-${i}">Eenheid${s.parts.length > 1 ? ` regel ${i + 1}` : ''}</label>
+              <select id="pu-${i}" class="input" data-part-unit="${i}">
+                ${UNITS.map((u) => `<option value="${u.id}"${u.id === p.unit ? ' selected' : ''}>${u.label}</option>`).join('')}
+              </select>
+              ${
+                s.parts.length > 1
+                  ? `<button type="button" class="icon-btn icon-btn-quiet" data-action="part-remove" data-id="${i}" aria-label="Regel ${i + 1} weghalen">${icon('x', 18)}</button>`
+                  : ''
+              }
+            </div>`,
+          )
+          .join('')}
+        <button type="button" class="btn btn-ghost btn-sm qty-add" data-action="part-add">+ Nog een</button>
       </div>
 
       ${s.error ? `<p class="error" role="alert">${esc(s.error)}</p>` : ''}
@@ -1587,7 +1599,7 @@ async function quickAdd(text) {
     const fields = {
       name: known.name || name,
       key,
-      qty: qty ?? known.defaultQty ?? null,
+      qty: qty ?? null,
       unit: unit || known.defaultUnit || 'st',
       storeId,
       sectionId,
@@ -1606,8 +1618,7 @@ async function quickAdd(text) {
     title: `Waar haal je ${name}?`,
     name,
     key,
-    qty: qty ?? '',
-    unit: unit || 'st',
+    parts: [{ qty: qty ?? '', unit: unit || 'st' }],
     storeId: activeStore,
     sectionId: resolveSection(known, storeById(activeStore), name),
   });
@@ -1629,11 +1640,17 @@ async function saveSheetItem() {
     renderSheet();
     return;
   }
-  const qty = parseQtyInput(s.qty);
+  // Meerdere regels: lege regels vallen weg; één regel = gewoon aantal + eenheid.
+  let parts = s.parts.map((p) => ({ qty: parseQtyInput(p.qty), unit: p.unit || 'st' }));
+  if (parts.length > 1) parts = parts.filter((p) => p.qty != null);
+  if (!parts.length) parts = [{ qty: null, unit: s.parts[0]?.unit || 'st' }];
+  const qty = parts[0].qty;
+  const unit = parts[0].unit;
+  const multi = parts.length > 1 ? parts : null;
 
   if (s.mode === 'item-new') {
     const pid = productIdFor(list.ownerUid, s.key);
-    const fields = { name: s.name, key: s.key, qty, unit: s.unit, storeId: s.storeId, sectionId: s.sectionId };
+    const fields = { name: s.name, key: s.key, qty, unit, parts: multi, storeId: s.storeId, sectionId: s.sectionId };
     const store = storeById(s.storeId);
     const generalSectionId = generalSectionFor(s.sectionId, s.name);
     const extra = store?.chainId ? { sectionByChain: { [store.chainId]: s.sectionId } } : {};
@@ -1652,9 +1669,10 @@ async function saveSheetItem() {
     return;
   }
   const key = productKey(name);
-  const next = { name, key, qty, unit: s.unit, storeId: s.storeId, sectionId: s.sectionId };
+  const next = { name, key, qty, unit, parts: multi, storeId: s.storeId, sectionId: s.sectionId };
   if (key !== item.key) next.productId = productIdFor(item.ownerUid, key);
-  const changes = Object.fromEntries(Object.entries(next).filter(([k, v]) => (item[k] ?? null) !== (v ?? null)));
+  const same = (x, y) => JSON.stringify(x ?? null) === JSON.stringify(y ?? null);
+  const changes = Object.fromEntries(Object.entries(next).filter(([k, v]) => !same(item[k], v)));
   closeSheet();
   if (!Object.keys(changes).length) return;
 
@@ -1668,7 +1686,7 @@ async function saveSheetItem() {
       if (chainId) data.sectionByChain = { [chainId]: next.sectionId };
       data.sectionId = generalSectionFor(next.sectionId, name);
     }
-    if (!state.products.has(pid)) Object.assign(data, { defaultQty: qty, preferredStoreId: next.storeId });
+    if (!state.products.has(pid)) Object.assign(data, { preferredStoreId: next.storeId });
     productUpdates = { id: pid, data };
   }
   if (!item.productId && !changes.productId) changes.productId = pid;
@@ -1989,8 +2007,10 @@ document.addEventListener('click', async (e) => {
         title: `${item.name} bewerken`,
         itemId: item.id,
         name: item.name,
-        qty: item.qty ?? '',
-        unit: item.unit || 'st',
+        parts:
+          Array.isArray(item.parts) && item.parts.length > 1
+            ? item.parts.map((p) => ({ qty: p.qty ?? '', unit: p.unit || 'st' }))
+            : [{ qty: item.qty ?? '', unit: item.unit || 'st' }],
         storeId: item.storeId,
         sectionId: displaySection(storeById(item.storeId), item.sectionId)?.id || fallbackSection()?.id,
       });
@@ -2029,6 +2049,22 @@ document.addEventListener('click', async (e) => {
       sh.storeId = id;
       sh.error = '';
       if (!sh.sectionTouched || !sectionAvailable(st, sh.sectionId)) sh.sectionId = resolveSection(sheetProduct(sh), st, sh.name);
+      renderSheet();
+      break;
+    }
+    case 'part-add': {
+      const sh = state.sheet;
+      if (!sh) break;
+      const last = sh.parts[sh.parts.length - 1];
+      sh.parts.push({ qty: '', unit: last?.unit || 'st' });
+      renderSheet();
+      document.getElementById(`pq-${sh.parts.length - 1}`)?.focus();
+      break;
+    }
+    case 'part-remove': {
+      const sh = state.sheet;
+      if (!sh || sh.parts.length < 2) break;
+      sh.parts.splice(Number(id), 1);
       renderSheet();
       break;
     }
@@ -2330,6 +2366,11 @@ document.addEventListener('change', async (e) => {
     return;
   }
 
+  if (t.dataset.partUnit !== undefined && state.sheet?.parts) {
+    state.sheet.parts[Number(t.dataset.partUnit)].unit = t.value;
+    return;
+  }
+
   // Item-sheet: sectie kiezen of een nieuwe maken.
   if (state.sheet && t.dataset.field === 'sectionId') {
     if (t.value === '__new__') {
@@ -2463,6 +2504,10 @@ document.addEventListener('change', async (e) => {
 });
 
 document.addEventListener('input', (e) => {
+  if (e.target.dataset?.partQty !== undefined && state.sheet?.parts) {
+    state.sheet.parts[Number(e.target.dataset.partQty)].qty = e.target.value;
+    return;
+  }
   if (e.target.dataset?.importText !== undefined && state.importDraft) {
     state.importDraft.text = e.target.value;
     return;

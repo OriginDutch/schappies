@@ -59,6 +59,22 @@ export function productKey(name) {
     .slice(0, 120);
 }
 
+// Hoeveelheid van een item: één regel ("500 g") of meerdere
+// ("1000 g + 250 g + 250 g (1500 g)"; totaal alleen bij dezelfde eenheid).
+export function formatItemQty(item) {
+  const parts = Array.isArray(item?.parts) && item.parts.length > 1 ? item.parts : null;
+  if (!parts) return formatQty(item?.qty, item?.unit);
+  const shown = parts.map((x) => formatQty(x.qty, x.unit)).filter(Boolean);
+  if (!shown.length) return '';
+  const units = new Set(parts.map((x) => x.unit));
+  const allNumbers = parts.every((x) => x.qty != null && x.qty !== '');
+  if (units.size === 1 && allNumbers && shown.length > 1) {
+    const total = Math.round(parts.reduce((s, x) => s + Number(x.qty), 0) * 1000) / 1000;
+    return `${shown.join(' + ')} (${formatQty(total, parts[0].unit)})`;
+  }
+  return shown.join(' + ');
+}
+
 export function formatQty(qty, unit) {
   if (qty == null || qty === '') return '';
   const n = Number(qty);

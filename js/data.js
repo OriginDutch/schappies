@@ -484,6 +484,7 @@ export async function addItem(hid, user, list, fields, product) {
     productId: product.id,
     qty: fields.qty,
     unit: fields.unit,
+    parts: fields.parts || null,
     listId: list.id,
     ownerUid: list.ownerUid,
     storeId: fields.storeId,
@@ -512,7 +513,6 @@ export async function addItem(hid, user, list, fields, product) {
       sectionId: product.generalSectionId || fields.sectionId,
       ...(product.extra || {}),
       defaultUnit: fields.unit,
-      defaultQty: fields.qty,
       preferredStoreId: fields.storeId,
       createdAt: serverTimestamp(),
     });

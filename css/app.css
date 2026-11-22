@@ -1412,6 +1412,18 @@ details.card[open] > summary::after {
   margin-top: 6px;
 }
 
+.qty-head,
+.qty-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 44px;
+  gap: 8px;
+  align-items: center;
+}
+
+.qty-add {
+  align-self: flex-start;
+}
+
 /* ---------- desktop ---------- */
 
 @media (min-width: 900px) {

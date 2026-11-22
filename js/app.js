@@ -250,7 +250,7 @@ function renderSetup(message = '') {
         <p class="muted">Maak je huishouden aan. Later kun je hier anderen voor uitnodigen.</p>
         <label class="field">
           <span class="field-label">Naam van het huishouden</span>
-          <input class="input" name="name" required maxlength="60" autocomplete="off" value="Thuis">
+          <input class="input" name="name" required maxlength="60" autocomplete="off" autocapitalize="sentences" value="Thuis">
         </label>
         <button class="btn btn-primary btn-block" type="submit">Huishouden aanmaken</button>
         <button class="btn btn-ghost btn-block" type="button" data-action="logout">Ander account gebruiken</button>
@@ -292,7 +292,7 @@ function mountShell() {
         <form class="addbar" id="addbar" data-form="quick-add" autocomplete="off" hidden>
           <label class="sr-only" for="add-input">Product toevoegen</label>
           <input id="add-input" class="input addbar-input" name="q" list="product-names"
-            placeholder="Product toevoegen…" enterkeyhint="done" autocomplete="off" maxlength="80">
+            placeholder="Product toevoegen…" enterkeyhint="done" autocomplete="off" maxlength="80" autocapitalize="sentences">
           <button class="btn btn-primary addbar-btn" type="submit" aria-label="Toevoegen">${icon('plus', 22)}</button>
           <datalist id="product-names"></datalist>
         </form>
@@ -493,7 +493,7 @@ function viewLijst() {
         <p class="muted">Voeg je eerste winkel toe. Meer winkels kun je altijd later toevoegen.</p>
         <div class="inline-form">
           <label class="sr-only" for="first-store">Naam van de winkel</label>
-          <input id="first-store" class="input" name="name" placeholder="Bijv. Lidl" maxlength="40" required>
+          <input id="first-store" class="input" name="name" placeholder="Bijv. Lidl" maxlength="40" required autocapitalize="sentences">
           <button class="btn btn-primary" type="submit">Toevoegen</button>
         </div>
       </form>`;
@@ -603,7 +603,7 @@ function viewWinkels() {
       <h2 class="card-title">Winkel toevoegen</h2>
       <div class="add-section">
         <label class="sr-only" for="new-store">Naam van de winkel</label>
-        <input id="new-store" class="input" name="name" placeholder="Bijv. Kruidvat of Lidl Leeuwarden" maxlength="40" required>
+        <input id="new-store" class="input" name="name" placeholder="Bijv. Kruidvat of Lidl Leeuwarden" maxlength="40" required autocapitalize="sentences">
         <label class="sr-only" for="new-store-chain">Keten</label>
         <select id="new-store-chain" class="input" name="chain">
           <option value="">Nieuwe keten</option>
@@ -625,7 +625,7 @@ function viewWinkels() {
                     return `
                       <form class="store-row" data-form="rename-store" data-id="${s.id}">
                         <label class="sr-only" for="rename-${s.id}">Nieuwe naam</label>
-                        <input id="rename-${s.id}" class="input" name="name" value="${esc(s.name)}" maxlength="40" required>
+                        <input id="rename-${s.id}" class="input" name="name" value="${esc(s.name)}" maxlength="40" required autocapitalize="sentences">
                         <button class="btn btn-primary btn-sm" type="submit">Opslaan</button>
                         <button class="btn btn-ghost btn-sm" type="button" data-action="cancel-rename">Annuleren</button>
                       </form>`;
@@ -719,7 +719,7 @@ function viewLayout(store) {
         <div class="layout-head">
           <span class="layout-num mono">${gi + 1}</span>
           <label class="sr-only" for="lg-${g.id}">Naam van blok ${gi + 1}</label>
-          <input id="lg-${g.id}" class="input layout-name" data-layout-name="${g.id}" value="${esc(g.name)}" maxlength="40">
+          <input id="lg-${g.id}" class="input layout-name" data-layout-name="${g.id}" value="${esc(g.name)}" maxlength="40" autocapitalize="sentences">
           <button class="icon-btn icon-btn-quiet" data-action="layout-up" data-id="${g.id}" ${gi === 0 ? 'disabled' : ''} aria-label="${esc(g.name)} omhoog">${icon('up', 18)}</button>
           <button class="icon-btn icon-btn-quiet" data-action="layout-down" data-id="${g.id}" ${gi === layout.length - 1 ? 'disabled' : ''} aria-label="${esc(g.name)} omlaag">${icon('down', 18)}</button>
           <button class="icon-btn icon-btn-quiet" data-action="layout-delete" data-id="${g.id}" aria-label="${esc(g.name)} verwijderen">${icon('trash', 18)}</button>
@@ -744,7 +744,7 @@ function viewLayout(store) {
             ? `<form class="new-section" data-form="layout-new-section" data-group="${g.id}">
                 <div class="inline-form">
                   <label class="sr-only" for="lns-${g.id}">Naam nieuwe sectie</label>
-                  <input id="lns-${g.id}" class="input" name="name" placeholder="Bijv. Kaas (koeling)" maxlength="40" required>
+                  <input id="lns-${g.id}" class="input" name="name" placeholder="Bijv. Kaas (koeling)" maxlength="40" required autocapitalize="sentences">
                   <button class="btn btn-primary" type="submit">Toevoegen</button>
                 </div>
                 ${chain ? `<label class="check-row"><input type="checkbox" name="onlyStore" checked> Alleen voor ${esc(chain.name)}</label>` : ''}
@@ -957,7 +957,7 @@ function sectionRow(s, idx, total, kind) {
     <div class="sec-row">
       <div class="sec-row-main">
         <label class="sr-only" for="sn-${s.id}">Naam</label>
-        <input id="sn-${s.id}" class="input sec-row-name" data-section-name="${s.id}" value="${esc(s.name)}" maxlength="40">
+        <input id="sn-${s.id}" class="input sec-row-name" data-section-name="${s.id}" value="${esc(s.name)}" maxlength="40" autocapitalize="sentences">
         ${
           movable
             ? `<button class="icon-btn icon-btn-quiet" data-action="section-up" data-list="${kind}" data-id="${s.id}" ${idx === 0 ? 'disabled' : ''} aria-label="${esc(s.name)} omhoog">${icon('up', 18)}</button>
@@ -1022,7 +1022,7 @@ function viewSecties() {
       }
       <form class="add-section" data-form="add-section">
         <label class="sr-only" for="new-section-name">Naam nieuwe sectie</label>
-        <input id="new-section-name" class="input" name="name" placeholder="Nieuwe sectie" maxlength="40" required>
+        <input id="new-section-name" class="input" name="name" placeholder="Nieuwe sectie" maxlength="40" required autocapitalize="sentences">
         <label class="sr-only" for="new-section-parent">Valt onder</label>
         ${parentSelect('new-section-parent', 'overig', 'name="parent"')}
         <button class="btn btn-primary" type="submit">Toevoegen</button>
@@ -1047,7 +1047,7 @@ function viewChain(chain) {
       <div>
         <button class="back-link" data-action="chain-back">${icon('back', 16)} Winkels</button>
         <label class="sr-only" for="chain-name">Naam van de keten</label>
-        <input id="chain-name" class="title-input" data-chain-name="${chain.id}" value="${esc(chain.name)}" maxlength="40">
+        <input id="chain-name" class="title-input" data-chain-name="${chain.id}" value="${esc(chain.name)}" maxlength="40" autocapitalize="sentences">
       </div>
     </header>
     <p class="muted">Deze secties gelden voor alle filialen. Een sectie vervangt de standaardsectie waar hij onder valt, en nieuwe producten komen daar vanzelf in.</p>
@@ -1067,7 +1067,7 @@ function viewChain(chain) {
       }
       <form class="inline-form" data-form="add-branch" data-chain="${chain.id}">
         <label class="sr-only" for="branch-name">Nieuw filiaal</label>
-        <input id="branch-name" class="input" name="name" placeholder="Bijv. ${esc(chain.name)} Leeuwarden" maxlength="40" required>
+        <input id="branch-name" class="input" name="name" placeholder="Bijv. ${esc(chain.name)} Leeuwarden" maxlength="40" required autocapitalize="sentences">
         <button class="btn btn-primary" type="submit">Toevoegen</button>
       </form>
     </section>
@@ -1092,7 +1092,7 @@ function viewChain(chain) {
       }
       <form class="add-section" data-form="add-chain-section" data-chain="${chain.id}">
         <label class="sr-only" for="chain-section-name">Naam nieuwe sectie</label>
-        <input id="chain-section-name" class="input" name="name" placeholder="Schapnaam, bijv. Koeling (Zuivel)" maxlength="40" required>
+        <input id="chain-section-name" class="input" name="name" placeholder="Schapnaam, bijv. Koeling (Zuivel)" maxlength="40" required autocapitalize="sentences">
         <label class="sr-only" for="chain-section-parent">Valt onder</label>
         <select id="chain-section-parent" class="input" name="parent">
           <option value="">valt onder: raden op naam</option>
@@ -1218,7 +1218,7 @@ function storeGrid(selectedId, s) {
       s.newStoreOpen
         ? `<div class="inline-form">
             <label class="sr-only" for="sheet-new-store">Naam nieuwe winkel</label>
-            <input id="sheet-new-store" class="input" data-field="newStoreName" value="${esc(s.newStoreName || '')}" placeholder="Naam winkel" maxlength="40" data-autofocus>
+            <input id="sheet-new-store" class="input" data-field="newStoreName" value="${esc(s.newStoreName || '')}" placeholder="Naam winkel" maxlength="40" data-autofocus autocapitalize="sentences">
             <button type="button" class="btn btn-primary" data-action="sheet-add-store">Toevoegen</button>
           </div>`
         : ''
@@ -1238,7 +1238,7 @@ function sheetItem(s) {
             </div>`
           : `<label class="field">
               <span class="field-label">Naam</span>
-              <input class="input" data-field="name" value="${esc(s.name)}" maxlength="80" required>
+              <input class="input" data-field="name" value="${esc(s.name)}" maxlength="80" required autocapitalize="sentences">
             </label>`
       }
 
@@ -1260,7 +1260,7 @@ function sheetItem(s) {
             ? `<div class="new-section">
                 <div class="inline-form">
                   <label class="sr-only" for="sheet-new-section">Naam nieuwe sectie</label>
-                  <input id="sheet-new-section" class="input" data-field="newSectionName" value="${esc(s.newSectionName || '')}" placeholder="Bijv. Kaas (koeling)" maxlength="40">
+                  <input id="sheet-new-section" class="input" data-field="newSectionName" value="${esc(s.newSectionName || '')}" placeholder="Bijv. Kaas (koeling)" maxlength="40" autocapitalize="sentences">
                   <button type="button" class="btn btn-primary" data-action="sheet-add-section">Toevoegen</button>
                 </div>
                 ${chainOf(store) ? `<label class="check-row"><input type="checkbox" data-field="newSectionOnlyStore"${s.newSectionOnlyStore !== false ? ' checked' : ''}> Alleen voor ${esc(chainOf(store).name)}</label>` : ''}
@@ -1325,7 +1325,7 @@ function sheetStores() {
       </div>
       <form class="inline-form" data-form="add-store">
         <label class="sr-only" for="sheet-store-name">Nieuwe winkel</label>
-        <input id="sheet-store-name" class="input" name="name" placeholder="Nieuwe winkel" maxlength="40" required>
+        <input id="sheet-store-name" class="input" name="name" placeholder="Nieuwe winkel" maxlength="40" required autocapitalize="sentences">
         <button class="btn btn-primary" type="submit">Toevoegen</button>
       </form>
     </div>`;

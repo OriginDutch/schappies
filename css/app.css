@@ -104,6 +104,11 @@ button {
   font-size: 14px;
 }
 
+.warn {
+  margin: 0;
+  color: var(--danger);
+}
+
 /* ---------- knoppen ---------- */
 
 .btn {

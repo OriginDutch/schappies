@@ -16,6 +16,8 @@ import {
   limit,
   onSnapshot,
   writeBatch,
+  runTransaction,
+  deleteDoc,
   serverTimestamp,
   increment,
   arrayUnion,
@@ -357,14 +359,18 @@ export function watchTrashItems(hid, uid, onData, onError) {
 }
 
 // Definitief verwijderen wat langer dan een week in de prullenbak ligt.
-// De rules controleren zelf ook of het echt een week is.
+// Per document, zodat één weigering (bijv. al door een ander toestel opgeruimd)
+// de rest niet tegenhoudt. De rules controleren zelf ook of het echt een week is.
 export async function purgeTrash(hid, user, targets) {
   if (!targets.length) return 0;
-  const batch = writeBatch(db);
-  for (const t of targets.slice(0, 400)) batch.delete(ref(hid, t.col, t.id));
-  logAction(batch, hid, user, { type: 'trash.purge', label: `Prullenbak: ${Math.min(targets.length, 400)} definitief verwijderd` });
-  await batch.commit();
-  return Math.min(targets.length, 400);
+  const results = await Promise.allSettled(targets.slice(0, 200).map((t) => deleteDoc(ref(hid, t.col, t.id))));
+  const n = results.filter((r) => r.status === 'fulfilled').length;
+  if (n) {
+    const batch = writeBatch(db);
+    logAction(batch, hid, user, { type: 'trash.purge', label: `Prullenbak: ${n} definitief verwijderd` });
+    await batch.commit().catch(() => {});
+  }
+  return n;
 }
 
 // Alleen actieve items (open + in de kar). Gearchiveerde/verwijderde items
@@ -396,9 +402,8 @@ export function toMillis(ts) {
 
 // ---------- activiteitenlog ----------
 
-function logAction(batch, hid, user, entry) {
-  const aRef = doc(col(hid, 'activity'));
-  batch.set(aRef, {
+function logEntry(user, entry) {
+  return {
     schemaVersion: SCHEMA_VERSION,
     by: user.uid,
     byName: user.displayName || '',
@@ -407,7 +412,12 @@ function logAction(batch, hid, user, entry) {
     before: null,
     after: null,
     ...entry,
-  });
+  };
+}
+
+function logAction(batch, hid, user, entry) {
+  const aRef = doc(col(hid, 'activity'));
+  batch.set(aRef, logEntry(user, entry));
   return aRef.id;
 }
 
@@ -416,11 +426,14 @@ function nestedIncrement(path, delta) {
   return path.reduceRight((acc, key) => ({ [key]: acc }), increment(delta));
 }
 
+// Teller op een product ophogen. ownerUid gaat mee, zodat het ook klopt met de
+// rules als het product intussen definitief verwijderd is.
 function applyProductEffect(batch, hid, effect, sign = 1) {
   if (!effect) return;
+  const extra = effect.ownerUid ? { ownerUid: effect.ownerUid } : {};
   batch.set(
     ref(hid, 'products', effect.productId),
-    { ...nestedIncrement(effect.path, effect.delta * sign), updatedAt: serverTimestamp() },
+    { ...nestedIncrement(effect.path, effect.delta * sign), ...extra, updatedAt: serverTimestamp() },
     { merge: true },
   );
 }
@@ -563,7 +576,8 @@ export async function addItem(hid, user, list, fields, product) {
   return { itemId: iRef.id, actionId };
 }
 
-export async function setItemChecked(hid, user, item, checked) {
+// productLive: bestaat het product nog? Anders geen teller bijhouden.
+export async function setItemChecked(hid, user, item, checked, productLive = true) {
   const batch = writeBatch(db);
   batch.update(ref(hid, 'items', item.id), {
     checked,
@@ -573,9 +587,10 @@ export async function setItemChecked(hid, user, item, checked) {
     updatedBy: user.uid,
   });
   // Afvinken telt als "gekocht bij deze winkel"; terugzetten draait dat terug.
-  const productEffect = item.productId
-    ? { productId: item.productId, path: ['storeCounts', item.storeId], delta: checked ? 1 : -1 }
-    : null;
+  const productEffect =
+    item.productId && productLive
+      ? { productId: item.productId, ownerUid: item.ownerUid, path: ['storeCounts', item.storeId], delta: checked ? 1 : -1 }
+      : null;
   applyProductEffect(batch, hid, productEffect);
   const actionId = logAction(batch, hid, user, {
     type: checked ? 'item.check' : 'item.uncheck',
@@ -592,7 +607,8 @@ export async function setItemChecked(hid, user, item, checked) {
 
 // changes: subset van { name, key, productId, qty, unit, storeId, sectionId }
 // productUpdates: geheugen bijwerken (sectie/eenheid corrigeren), of null.
-export async function updateItem(hid, user, item, changes, productUpdates) {
+// extraChanges: [{ col, id, before, after }] die mee ongedaan gemaakt worden (bijv. 'iedere keer').
+export async function updateItem(hid, user, item, changes, productUpdates, { productLive = true, extraChanges = [] } = {}) {
   const batch = writeBatch(db);
   const before = Object.fromEntries(Object.keys(changes).map((k) => [k, item[k] ?? null]));
   batch.update(ref(hid, 'items', item.id), { ...changes, updatedAt: serverTimestamp(), updatedBy: user.uid });
@@ -608,13 +624,17 @@ export async function updateItem(hid, user, item, changes, productUpdates) {
   // Ander winkel = doorsturen. Bijhouden voor de suggesties (3x zelfde richting).
   let productEffect = null;
   const moved = changes.storeId && changes.storeId !== item.storeId;
-  if (moved) {
+  if (moved && productLive && (changes.productId || item.productId)) {
     productEffect = {
       productId: changes.productId || item.productId,
+      ownerUid: item.ownerUid,
       path: ['forwardStats', `${item.storeId}__${changes.storeId}`],
       delta: 1,
     };
     applyProductEffect(batch, hid, productEffect);
+  }
+  for (const c of extraChanges) {
+    batch.update(ref(hid, c.col, c.id), { ...c.after, updatedAt: serverTimestamp(), updatedBy: user.uid });
   }
 
   const actionId = logAction(batch, hid, user, {
@@ -625,6 +645,7 @@ export async function updateItem(hid, user, item, changes, productUpdates) {
     before,
     after: changes,
     productEffect,
+    changes: extraChanges.length ? extraChanges : null,
   });
   await batch.commit();
   return actionId;
@@ -653,93 +674,112 @@ export async function deleteItem(hid, user, item) {
 
 // ---------- rondes ----------
 
-// Een ronde afronden bij één winkel, voor één lijst. Alles in één batch en
-// één regel in het log, dus in één keer ongedaan te maken.
+// Te veel schrijfacties voor één transactie (Firestore-limiet 500).
+const MAX_WRITES = 480;
+const conflict = (msg) => Object.assign(new Error(msg), { code: 'round-changed' });
+
+// Een ronde afronden bij één winkel, voor één lijst. Als transactie: eerst
+// controleren dat niemand anders hem net heeft afgerond of aangepast.
 // checked: afgevinkte items → naar de historie (archived + tripId).
-// open: [{ item, choice: 'stay'|'forward'|'trash', storeId, sectionId }]
-// recurring: [{ fields }] → nieuwe items voor 'iedere keer'-producten.
+// open: [{ item, choice: 'stay'|'forward'|'trash', storeId, sectionId, productLive }]
+// recurring: [{ fields, productId }] → nieuwe items voor 'iedere keer'-producten.
 // products: [{ id, before }] → lastBoughtAt/lastBoughtStoreId bijwerken.
 export async function finishRound(hid, user, { list, store, checked, open, recurring, products, names }) {
-  const batch = writeBatch(db);
-  const now = Timestamp.fromMillis(Date.now());
-  const changes = [];
-  let tripId = null;
+  const writes = checked.length + open.length * 2 + recurring.length + products.length + 3;
+  if (writes > MAX_WRITES) throw Object.assign(new Error('Te veel items in één ronde.'), { code: 'too-big' });
 
-  if (checked.length) {
-    const tRef = doc(col(hid, 'trips'));
-    tripId = tRef.id;
-    batch.set(tRef, {
-      schemaVersion: SCHEMA_VERSION,
-      ownerUid: list.ownerUid,
-      listId: list.id,
-      listName: list.name,
-      storeId: store.id,
-      storeName: store.name,
-      chainId: store.chainId || null,
-      finishedAt: now,
-      finishedBy: user.uid,
-      finishedByName: user.displayName || '',
-      items: checked.map((i) => tripLine(i, names)),
-      deleted: false,
-      createdAt: serverTimestamp(),
-      createdBy: user.uid,
+  const tRef = checked.length ? doc(col(hid, 'trips')) : null;
+  const newItemRefs = recurring.map(() => doc(col(hid, 'items')));
+  const aRef = doc(col(hid, 'activity'));
+
+  const actionId = await runTransaction(db, async (tx) => {
+    // Lezen: klopt de staat nog met wat dit toestel ziet?
+    const touched = [
+      ...checked.map((i) => ({ i, want: 'checked' })),
+      ...open.filter((o) => o.choice !== 'stay').map((o) => ({ i: o.item, want: 'open' })),
+    ];
+    const snaps = await Promise.all(touched.map((t) => tx.get(ref(hid, 'items', t.i.id))));
+    snaps.forEach((snap, k) => {
+      const d = snap.exists() ? snap.data() : null;
+      if (!d || d.archived || d.deleted) throw conflict('Deze ronde is net door iemand anders afgerond of aangepast.');
+      if (touched[k].want === 'checked' && !d.checked) throw conflict('Er is net iets teruggezet. Kijk even opnieuw.');
+      if (touched[k].want === 'open' && d.checked) throw conflict('Er is net iets afgevinkt. Kijk even opnieuw.');
     });
-    changes.push({ col: 'trips', id: tRef.id, before: { deleted: true }, after: { deleted: false } });
-    for (const i of checked) {
-      const after = { archived: true, tripId: tRef.id };
-      batch.update(ref(hid, 'items', i.id), { ...after, updatedAt: serverTimestamp(), updatedBy: user.uid });
-      changes.push({ col: 'items', id: i.id, before: { archived: false, tripId: null }, after });
-    }
-  }
 
-  for (const o of open) {
-    let before = null;
-    let after = null;
-    if (o.choice === 'forward' && o.storeId && o.storeId !== o.item.storeId) {
-      before = { storeId: o.item.storeId, sectionId: o.item.sectionId ?? null };
-      after = { storeId: o.storeId, sectionId: o.sectionId ?? null };
-      if (o.item.productId) {
-        applyProductEffect(batch, hid, {
-          productId: o.item.productId,
-          path: ['forwardStats', `${o.item.storeId}__${o.storeId}`],
-          delta: 1,
-        });
+    const now = Timestamp.fromMillis(Date.now());
+    const changes = [];
+    const effects = [];
+
+    if (tRef) {
+      tx.set(tRef, {
+        schemaVersion: SCHEMA_VERSION,
+        ownerUid: list.ownerUid,
+        listId: list.id,
+        listName: list.name,
+        storeId: store.id,
+        storeName: store.name,
+        chainId: store.chainId || null,
+        finishedAt: now,
+        finishedBy: user.uid,
+        finishedByName: user.displayName || '',
+        items: checked.map((i) => tripLine(i, names)),
+        removed: [],
+        deleted: false,
+        createdAt: serverTimestamp(),
+        createdBy: user.uid,
+      });
+      changes.push({ col: 'trips', id: tRef.id, before: { deleted: true }, after: { deleted: false } });
+      for (const i of checked) {
+        const after = { archived: true, tripId: tRef.id };
+        tx.update(ref(hid, 'items', i.id), { ...after, updatedAt: serverTimestamp(), updatedBy: user.uid });
+        changes.push({ col: 'items', id: i.id, before: { archived: false, tripId: null }, after });
       }
-    } else if (o.choice === 'trash') {
-      before = { deleted: false, archived: false };
-      after = { deleted: true, archived: true, deletedAt: now };
     }
-    if (!after) continue;
-    batch.update(ref(hid, 'items', o.item.id), { ...after, updatedAt: serverTimestamp(), updatedBy: user.uid });
-    changes.push({ col: 'items', id: o.item.id, before, after });
-  }
 
-  for (const r of recurring) {
-    const iRef = doc(col(hid, 'items'));
-    batch.set(iRef, newItemDoc(user, list, r.fields, r.productId));
-    changes.push({ col: 'items', id: iRef.id, before: { deleted: true, archived: true }, after: { deleted: false, archived: false } });
-  }
+    for (const o of open) {
+      let before = null;
+      let after = null;
+      if (o.choice === 'forward' && o.storeId && o.storeId !== o.item.storeId) {
+        before = { storeId: o.item.storeId, sectionId: o.item.sectionId ?? null };
+        after = { storeId: o.storeId, sectionId: o.sectionId ?? null };
+        if (o.item.productId && o.productLive) {
+          const e = { productId: o.item.productId, ownerUid: o.item.ownerUid, path: ['forwardStats', `${o.item.storeId}__${o.storeId}`], delta: 1 };
+          applyProductEffect(tx, hid, e);
+          effects.push(e);
+        }
+      } else if (o.choice === 'trash') {
+        before = { deleted: false, archived: false, deletedAt: null };
+        after = { deleted: true, archived: true, deletedAt: now };
+      }
+      if (!after) continue;
+      tx.update(ref(hid, 'items', o.item.id), { ...after, updatedAt: serverTimestamp(), updatedBy: user.uid });
+      changes.push({ col: 'items', id: o.item.id, before, after });
+    }
 
-  for (const p of products) {
-    const after = { lastBoughtAt: now, lastBoughtStoreId: store.id };
-    batch.update(ref(hid, 'products', p.id), { ...after, updatedAt: serverTimestamp() });
-    changes.push({ col: 'products', id: p.id, before: p.before, after });
-  }
+    recurring.forEach((r, k) => {
+      tx.set(newItemRefs[k], newItemDoc(user, list, r.fields, r.productId));
+      changes.push({ col: 'items', id: newItemRefs[k].id, before: { deleted: true, archived: true }, after: { deleted: false, archived: false } });
+    });
 
-  if (!changes.length) return { tripId: null, actionId: null };
-  const actionId = logAction(batch, hid, user, {
-    type: 'compound',
-    label: `Ronde ${store.name} afgerond`,
-    ownerUid: list.ownerUid,
-    changes,
+    for (const p of products) {
+      const after = { lastBoughtAt: now, lastBoughtStoreId: store.id };
+      tx.update(ref(hid, 'products', p.id), { ...after, updatedAt: serverTimestamp() });
+      changes.push({ col: 'products', id: p.id, before: p.before, after });
+    }
+
+    if (!changes.length) return null;
+    tx.set(aRef, logEntry(user, { type: 'compound', label: `Ronde ${store.name} afgerond`, ownerUid: list.ownerUid, changes, effects }));
+    return aRef.id;
   });
-  await batch.commit();
-  return { tripId, actionId };
+  return { tripId: tRef?.id || null, actionId };
 }
+
+const newLineId = () => Math.random().toString(36).slice(2, 10);
 
 // Kopie van een item zoals het in de historie komt. names: uid → naam.
 export function tripLine(i, names = {}) {
   return {
+    lineId: newLineId(),
     itemId: i.id || null,
     productId: i.productId || null,
     name: i.name,
@@ -777,28 +817,125 @@ function newItemDoc(user, list, fields, productId) {
   };
 }
 
-// Algemene samengestelde wijziging met nieuwe documenten erbij.
+// Eén bewerking op de regels van een ronde, op lineId (niet op positie), zodat
+// twee mensen tegelijk elkaars wijziging niet overschrijven.
+// Geeft { items, removed, inverse } of null als de regel er niet (meer) is.
+function applyTripOp(trip, op) {
+  const items = [...(trip.items || [])];
+  const removed = [...(trip.removed || [])];
+  const idx = items.findIndex((l) => l.lineId === op.lineId);
+  switch (op.op) {
+    case 'add': {
+      if (items.some((l) => l.lineId === op.line.lineId)) return null;
+      items.splice(Math.min(op.index ?? items.length, items.length), 0, op.line);
+      return { items, removed, inverse: { op: 'remove', lineId: op.line.lineId, toTrash: false } };
+    }
+    case 'remove': {
+      if (idx < 0) return null;
+      const [line] = items.splice(idx, 1);
+      if (op.toTrash) removed.push({ ...line, removedAt: Timestamp.fromMillis(Date.now()) });
+      return { items, removed, inverse: { op: 'restore', lineId: line.lineId, line, index: idx } };
+    }
+    case 'restore': {
+      if (idx >= 0) return null;
+      const r = removed.findIndex((l) => l.lineId === op.lineId);
+      let line = op.line;
+      if (r >= 0) [line] = removed.splice(r, 1);
+      if (!line) return null;
+      const { removedAt, ...clean } = line;
+      items.splice(Math.min(op.index ?? items.length, items.length), 0, clean);
+      return { items, removed, inverse: { op: 'remove', lineId: op.lineId, toTrash: r >= 0 } };
+    }
+    case 'edit': {
+      if (idx < 0) return null;
+      const before = Object.fromEntries(Object.keys(op.after).map((k) => [k, items[idx][k] ?? null]));
+      items[idx] = { ...items[idx], ...op.after };
+      return { items, removed, inverse: { op: 'edit', lineId: op.lineId, after: before } };
+    }
+    case 'purge': {
+      const r = removed.findIndex((l) => l.lineId === op.lineId);
+      if (r < 0) return null;
+      removed.splice(r, 1);
+      return { items, removed, inverse: null };
+    }
+    default:
+      return null;
+  }
+}
+
+// Bewerkingen op rondes uitvoeren binnen een transactie. strict: een regel die er
+// niet meer is = fout (bij gewone acties); bij undo gewoon overslaan.
+async function runTripOps(tx, hid, tripOps, strict) {
+  const ids = [...new Set(tripOps.map((t) => t.tripId))];
+  const snaps = await Promise.all(ids.map((id) => tx.get(ref(hid, 'trips', id))));
+  const trips = new Map(snaps.map((sn, k) => [ids[k], sn.exists() ? sn.data() : null]));
+  const inverses = [];
+  for (const t of tripOps) {
+    const trip = trips.get(t.tripId);
+    const res = trip && applyTripOp(trip, t);
+    if (!res) {
+      if (strict) throw conflict('Deze ronde is net aangepast. Kijk even opnieuw.');
+      continue;
+    }
+    trip.items = res.items;
+    trip.removed = res.removed;
+    if (res.inverse) inverses.unshift({ tripId: t.tripId, ...res.inverse });
+  }
+  const write = () => {
+    for (const id of ids) {
+      const trip = trips.get(id);
+      if (trip) tx.update(ref(hid, 'trips', id), { items: trip.items || [], removed: trip.removed || [], updatedAt: serverTimestamp() });
+    }
+  };
+  return { inverses, write };
+}
+
+// Algemene samengestelde wijziging, in één keer ongedaan te maken.
 // creates: [{ col, data, before, after }] — data is het volledige nieuwe document;
 //   before/after zijn de velden die undo omzet (bijv. deleted true/false).
 // changes: [{ col, id, before, after }] — gewone updates.
-export async function commitCompound(hid, user, { label, ownerUid = SHARED, creates = [], changes = [] }) {
-  const batch = writeBatch(db);
-  const all = [];
-  const ids = [];
-  for (const c of creates) {
-    const dRef = doc(col(hid, c.col));
-    ids.push(dRef.id);
-    batch.set(dRef, { schemaVersion: SCHEMA_VERSION, ...c.data, createdAt: serverTimestamp(), createdBy: user.uid, updatedAt: serverTimestamp(), updatedBy: user.uid });
-    all.push({ col: c.col, id: dRef.id, before: c.before, after: c.after });
+// effects: [{ productId, ownerUid, path, delta }] — tellers (increment, ook bij undo).
+// tripOps: [{ tripId, op, ... }] — regels van een ronde, als transactie.
+export async function commitCompound(hid, user, { label, ownerUid = SHARED, creates = [], changes = [], effects = [], tripOps = [] }) {
+  if (!creates.length && !changes.length && !effects.length && !tripOps.length) return { actionId: null, ids: [] };
+  const createRefs = creates.map((c) => doc(col(hid, c.col)));
+  const aRef = doc(col(hid, 'activity'));
+  const writeRest = (w) => {
+    const all = [];
+    creates.forEach((c, k) => {
+      w.set(createRefs[k], { schemaVersion: SCHEMA_VERSION, ...c.data, createdAt: serverTimestamp(), createdBy: user.uid, updatedAt: serverTimestamp(), updatedBy: user.uid });
+      all.push({ col: c.col, id: createRefs[k].id, before: c.before, after: c.after });
+    });
+    for (const c of changes) {
+      w.update(ref(hid, c.col, c.id), { ...c.after, updatedAt: serverTimestamp(), updatedBy: user.uid });
+      all.push({ col: c.col, id: c.id, before: c.before, after: c.after });
+    }
+    for (const e of effects) applyProductEffect(w, hid, e);
+    return all;
+  };
+
+  if (tripOps.length) {
+    await runTransaction(db, async (tx) => {
+      const t = await runTripOps(tx, hid, tripOps, true);
+      t.write();
+      const all = writeRest(tx);
+      tx.set(aRef, logEntry(user, { type: 'compound', label, ownerUid, changes: all, effects, tripUndo: t.inverses }));
+    });
+  } else {
+    const batch = writeBatch(db);
+    const all = writeRest(batch);
+    batch.set(aRef, logEntry(user, { type: 'compound', label, ownerUid, changes: all, effects }));
+    await batch.commit();
   }
-  for (const c of changes) {
-    batch.update(ref(hid, c.col, c.id), { ...c.after, updatedAt: serverTimestamp(), updatedBy: user.uid });
-    all.push({ col: c.col, id: c.id, before: c.before, after: c.after });
-  }
-  if (!all.length) return { actionId: null, ids };
-  const actionId = logAction(batch, hid, user, { type: 'compound', label, ownerUid, changes: all });
-  await batch.commit();
-  return { actionId, ids };
+  return { actionId: aRef.id, ids: createRefs.map((r) => r.id) };
+}
+
+// Regels die langer dan een week in de prullenbak van een ronde liggen opruimen.
+export async function purgeTripLines(hid, tripId, lineIds) {
+  await runTransaction(db, async (tx) => {
+    const t = await runTripOps(tx, hid, lineIds.map((lineId) => ({ tripId, op: 'purge', lineId })), false);
+    t.write();
+  });
 }
 
 export { newItemDoc };
@@ -933,38 +1070,51 @@ export const UNDOABLE = new Set([
 ]);
 
 export async function undoAction(hid, user, action) {
-  if (action.changes?.length) {
-    const batch = writeBatch(db);
-    for (const c of action.changes) {
-      batch.update(ref(hid, c.col, c.id), { ...c.before, updatedAt: serverTimestamp(), updatedBy: user.uid });
+  const changes = action.changes || [];
+  const effects = action.effects || [];
+  const tripUndo = action.tripUndo || [];
+  const hasTarget = UNDOABLE.has(action.type) && action.target && action.before;
+  if (!changes.length && !effects.length && !tripUndo.length && !hasTarget) throw new Error('Niet terug te draaien');
+
+  const aRef = doc(col(hid, 'activity'));
+  const writeAll = (w) => {
+    if (hasTarget) {
+      const fields = { ...action.before, updatedAt: serverTimestamp(), updatedBy: user.uid };
+      if ('checked' in action.before) {
+        fields.checkedAt = action.before.checked ? serverTimestamp() : null;
+        fields.checkedBy = action.before.checked ? user.uid : null;
+      }
+      w.update(ref(hid, action.target.col, action.target.id), fields);
     }
-    logAction(batch, hid, user, {
-      type: 'undo',
-      undoOf: action.id,
-      label: `Ongedaan: ${action.label}`,
-      ownerUid: action.ownerUid || SHARED,
-      changes: action.changes.map((c) => ({ col: c.col, id: c.id, before: c.after, after: c.before })),
+    for (const c of changes) {
+      w.update(ref(hid, c.col, c.id), { ...c.before, updatedAt: serverTimestamp(), updatedBy: user.uid });
+    }
+    for (const e of effects) applyProductEffect(w, hid, e, -1);
+    applyProductEffect(w, hid, action.productEffect, -1);
+    w.set(
+      aRef,
+      logEntry(user, {
+        type: 'undo',
+        undoOf: action.id,
+        label: `Ongedaan: ${action.label}`,
+        ownerUid: action.ownerUid || SHARED,
+        target: action.target || null,
+        before: action.after || null,
+        after: action.before || null,
+        changes: changes.map((c) => ({ col: c.col, id: c.id, before: c.after, after: c.before })),
+      }),
+    );
+  };
+
+  if (tripUndo.length) {
+    await runTransaction(db, async (tx) => {
+      const t = await runTripOps(tx, hid, tripUndo, false);
+      t.write();
+      writeAll(tx);
     });
+  } else {
+    const batch = writeBatch(db);
+    writeAll(batch);
     await batch.commit();
-    return;
   }
-  if (!UNDOABLE.has(action.type) || !action.target || !action.before) throw new Error('Niet terug te draaien');
-  const batch = writeBatch(db);
-  const fields = { ...action.before, updatedAt: serverTimestamp(), updatedBy: user.uid };
-  if ('checked' in action.before) {
-    fields.checkedAt = action.before.checked ? serverTimestamp() : null;
-    fields.checkedBy = action.before.checked ? user.uid : null;
-  }
-  batch.update(ref(hid, action.target.col, action.target.id), fields);
-  applyProductEffect(batch, hid, action.productEffect, -1);
-  logAction(batch, hid, user, {
-    type: 'undo',
-    undoOf: action.id,
-    label: `Ongedaan: ${action.label}`,
-    ownerUid: action.ownerUid || SHARED,
-    target: action.target,
-    before: action.after,
-    after: action.before,
-  });
-  await batch.commit();
 }

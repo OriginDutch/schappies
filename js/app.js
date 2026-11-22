@@ -52,6 +52,7 @@ import {
   nowTs,
   watchTrashItems,
   purgeTrash,
+  purgeTripLines,
   tripLine,
   DEFAULT_SECTIONS,
 } from './data.js';
@@ -169,10 +170,12 @@ const icon = (name, size = 20) =>
 function stopWatching() {
   state.unsubs.forEach((u) => u());
   state.unsubs = [];
+  state.loaded = new Set();
   stopInvitesWatch();
   stopTripsWatch();
   stopTrashWatch();
   purgeDone = false;
+  linePurgeDone = false;
 }
 
 // Uitnodigingen pas ophalen als je het ledenscherm (Opties) opent. Een
@@ -203,7 +206,8 @@ function ensureTripsWatch() {
     (trips) => {
       state.trips = trips;
       state.tripsReady = true;
-      if (state.view === 'historie') render();
+      maybePurgeLines();
+      if (state.view === 'historie' || state.view === 'opties') render();
     },
     (err) => {
       console.warn('Historie niet beschikbaar:', err?.message);
@@ -258,6 +262,8 @@ function friendlyError(err) {
     return `Dit domein (${location.hostname}) mag nog niet inloggen. Voeg het toe in Firebase → Authentication → Settings → Authorized domains.`;
   if (code === 'auth/network-request-failed' || code === 'unavailable') return 'Geen verbinding. Check je internet en probeer opnieuw.';
   if (code === 'permission-denied') return 'Geen toegang. Zijn de nieuwste security rules gedeployed?';
+  if (code === 'round-changed') return err.message;
+  if (code === 'too-big') return 'Te veel items in één keer. Rond de ronde in delen af.';
   if (code === 'not-found') return 'Dat kan niet meer: het is definitief verwijderd (langer dan een week in de prullenbak).';
   return `Er ging iets mis (${code || err?.message || 'onbekend'}).`;
 }
@@ -602,7 +608,7 @@ function renderDatalist() {
   if (!dl) return;
   const list = activeList();
   const names = [...state.products.values()]
-    .filter((p) => !list || p.ownerUid === SHARED || p.ownerUid === list.ownerUid)
+    .filter((p) => !p.deleted && (!list || p.ownerUid === SHARED || p.ownerUid === list.ownerUid))
     .map((p) => p.name)
     .filter(Boolean);
   const unique = [...new Set(names)].sort((a, b) => a.localeCompare(b, 'nl'));
@@ -849,7 +855,7 @@ function viewHistorie() {
     return `${head}<section class="card"><p class="error" role="alert">${esc(state.tripsError)}</p></section>`;
   }
   if (!state.tripsReady) return `${head}<p class="muted">Laden…</p>`;
-  if (!state.trips.length) {
+  if (!state.trips.some((t) => (t.items || []).length)) {
     return `${head}
       <section class="card empty">
         <h2 class="card-title">Nog geen rondes</h2>
@@ -858,7 +864,7 @@ function viewHistorie() {
   }
   return `${head}
     <div class="trips">
-      ${state.trips.map(tripCard).join('')}
+      ${state.trips.filter((t) => (t.items || []).length).map(tripCard).join('')}
     </div>`;
 }
 
@@ -879,7 +885,7 @@ function tripCard(t) {
               <p class="muted small">Afgerond door ${esc(t.finishedByName || memberName(t.finishedBy))}</p>
               <div class="trip-items">
                 ${items
-                  .map((line, idx) => {
+                  .map((line) => {
                     const qty = formatItemQty(line);
                     return `<div class="trip-item">
                       <div class="trip-item-main">
@@ -887,8 +893,8 @@ function tripCard(t) {
                         ${qty ? `<span class="item-qty">${esc(qty)}</span>` : ''}
                         <span class="trip-by muted small">${line.added ? 'later toegevoegd' : `✓ ${esc(line.checkedByName || memberName(line.checkedBy) || '')}`}</span>
                       </div>
-                      <button class="btn btn-ghost btn-sm" data-action="trip-again" data-id="${t.id}" data-idx="${idx}">Nog een keer</button>
-                      <button class="icon-btn icon-btn-quiet" data-action="trip-item-edit" data-id="${t.id}" data-idx="${idx}" aria-label="${esc(line.name)} aanpassen">${icon('edit', 18)}</button>
+                      <button class="btn btn-ghost btn-sm" data-action="trip-again" data-id="${t.id}" data-line="${esc(line.lineId)}">Nog een keer</button>
+                      <button class="icon-btn icon-btn-quiet" data-action="trip-item-edit" data-id="${t.id}" data-line="${esc(line.lineId)}" aria-label="${esc(line.name)} aanpassen">${icon('edit', 18)}</button>
                     </div>`;
                   })
                   .join('')}
@@ -991,6 +997,7 @@ function sheetProductEdit(sh) {
       <div class="field">
         <label class="field-label" for="pp-store">Vaste winkel</label>
         <select id="pp-store" class="input" data-field="preferredStoreId">
+          ${sh.preferredStoreId ? '' : '<option value="" selected>— geen —</option>'}
           ${state.stores.map((x) => `<option value="${x.id}"${x.id === sh.preferredStoreId ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}
         </select>
       </div>
@@ -1010,7 +1017,24 @@ function sheetProductEdit(sh) {
       <label class="check-row"><input type="checkbox" data-field="recurring"${sh.recurring ? ' checked' : ''}> Iedere keer op de lijst</label>
       ${sh.error ? `<p class="error" role="alert">${esc(sh.error)}</p>` : ''}
       <button class="btn btn-primary btn-block" type="submit">Opslaan</button>
-      <button class="btn btn-ghost btn-block btn-danger" type="button" data-action="product-delete">Naar de prullenbak</button>
+      ${
+        sh.confirmDelete
+          ? (() => {
+              const open = liveItems().filter((i) => i.productId === p.id);
+              return `<div class="remove-choice">
+                ${
+                  open.length && TRASH_OPEN_ITEMS
+                    ? `<p class="warn small">Let op: ${esc(p.name)} staat nog op de lijst (${open
+                        .map((i) => esc(storeById(i.storeId)?.name || '?'))
+                        .join(', ')}). ${open.length === 1 ? 'Dat item gaat' : 'Die items gaan'} mee naar de prullenbak.</p>`
+                    : ''
+                }
+                <p class="muted small">${esc(p.name)} blijft ${TRASH_DAYS} dagen in de prullenbak. Daarna is het geheugen van dit product definitief weg.</p>
+                <button class="btn btn-ghost btn-block btn-danger" type="button" data-action="product-delete">Ja, naar de prullenbak</button>
+              </div>`;
+            })()
+          : `<button class="btn btn-ghost btn-block btn-danger" type="button" data-action="product-delete-ask">Naar de prullenbak</button>`
+      }
     </form>`;
 }
 
@@ -1027,7 +1051,7 @@ function openProductSheet(pid) {
     title: p.name,
     productId: pid,
     name: p.name,
-    preferredStoreId: storeById(p.preferredStoreId) ? p.preferredStoreId : state.stores[0]?.id || null,
+    preferredStoreId: storeById(p.preferredStoreId) ? p.preferredStoreId : '',
     defaultUnit: p.defaultUnit || 'st',
     generalSectionId: generalSectionFor(p.sectionId, p.name),
     chainSections,
@@ -1042,28 +1066,47 @@ const TRASH_DAYS = 7;
 const DAY = 24 * 3600 * 1000;
 const trashedAt = (d) => toMillisSafe(d.deletedAt) || toMillisSafe(d.updatedAt) || Date.now();
 
-function trashEntries() {
+// all: ook dingen zonder deletedAt (ongedaan gemaakte toevoegingen). Die tonen
+// we niet, maar ruimen we na een week wel op.
+function trashEntries(all = false) {
   const out = [];
+  const shown = (d) => all || !!d.deletedAt;
   for (const p of state.products.values()) {
-    if (p.deleted && (p.ownerUid === SHARED || p.ownerUid === state.user.uid)) {
+    if (p.deleted && p.name && shown(p) && (p.ownerUid === SHARED || p.ownerUid === state.user.uid)) {
       out.push({ col: 'products', id: p.id, name: p.name || '?', kind: 'product', at: trashedAt(p), ownerUid: p.ownerUid });
     }
   }
-  for (const i of state.trashItems) {
+  for (const i of state.trashItems.filter(shown)) {
     out.push({ col: 'items', id: i.id, name: i.name || '?', kind: `item${storeById(i.storeId) ? ` · ${storeById(i.storeId).name}` : ''}`, at: trashedAt(i), ownerUid: i.ownerUid, doc: i });
   }
-  for (const st of state.allStores.filter((x) => x.deleted)) {
+  for (const st of state.allStores.filter((x) => x.deleted && shown(x))) {
     out.push({ col: 'stores', id: st.id, name: st.name, kind: 'winkel', at: trashedAt(st), ownerUid: SHARED });
   }
-  for (const sec of state.allSections.filter((x) => x.deleted && x.custom)) {
+  for (const sec of state.allSections.filter((x) => x.deleted && x.custom && shown(x))) {
     const chain = chainById(sec.chainId);
     out.push({ col: 'sections', id: sec.id, name: sec.name, kind: `sectie${chain ? ` · ${chain.name}` : ''}`, at: trashedAt(sec), ownerUid: SHARED });
+  }
+  // Regels die met "Alleen uit de historie" uit een ronde zijn gehaald.
+  for (const t of state.trips) {
+    for (const line of t.removed || []) {
+      out.push({
+        col: 'line',
+        id: `${t.id}:${line.lineId}`,
+        tripId: t.id,
+        lineId: line.lineId,
+        name: line.name,
+        kind: `uit ronde ${t.storeName} · ${formatWhen(t.finishedAt)}`,
+        at: toMillisSafe(line.removedAt) || Date.now(),
+        ownerUid: t.ownerUid,
+      });
+    }
   }
   return out.sort((a, b) => b.at - a.at);
 }
 
 function viewPrullenbak() {
   ensureTrashWatch();
+  ensureTripsWatch();
   const entries = trashEntries();
   const left = (at) => {
     const days = Math.ceil((at + TRASH_DAYS * DAY - Date.now()) / DAY);
@@ -1101,14 +1144,45 @@ function viewPrullenbak() {
 async function restoreFromTrash(colName, id) {
   const e = trashEntries().find((x) => x.col === colName && x.id === id);
   if (!e) return;
-  let change;
-  if (colName === 'items') {
-    change = { col: 'items', id, before: { deleted: true, archived: true, checked: !!e.doc?.checked }, after: { deleted: false, archived: false, checked: false } };
+  // Ongedaan maken van terugzetten = weer in de prullenbak, vanaf nu.
+  const back = { deleted: true, deletedAt: nowTs() };
+  let label = `${e.name} teruggezet uit de prullenbak`;
+  const opts = { ownerUid: e.ownerUid };
+
+  if (colName === 'line') {
+    opts.tripOps = [{ tripId: e.tripId, op: 'restore', lineId: e.lineId }];
+    // Bij weghalen ging de telling eraf; bij terugzetten komt hij er weer bij.
+    const t = tripById(e.tripId);
+    const line = (t?.removed || []).find((l) => l.lineId === e.lineId);
+    const p = line?.productId ? state.products.get(line.productId) : null;
+    if (p?.name && (!line.added || COUNT_ADDED_TO_TRIP)) {
+      const eff = countEffect(p, t.storeId, 1);
+      if (eff) opts.effects = [eff];
+    }
+    label = `${e.name} terug in ronde ${tripById(e.tripId)?.storeName || ''}`.trim();
+  } else if (colName === 'items') {
+    const i = e.doc;
+    const after = { deleted: false, archived: false, checked: false, deletedAt: null };
+    const before = { ...back, archived: true, checked: !!i?.checked };
+    // Winkel bestaat niet meer: naar de vaste winkel (of de eerste), anders zie je het nergens.
+    if (!storeById(i?.storeId)) {
+      const p = liveProduct(i?.productId);
+      const to = storeById(p?.preferredStoreId) || state.stores[0];
+      if (!to) return toast('Er is geen winkel om het item in terug te zetten');
+      Object.assign(after, { storeId: to.id, sectionId: resolveSection(p, to, i.name) });
+      Object.assign(before, { storeId: i?.storeId ?? null, sectionId: i?.sectionId ?? null });
+      label = `${e.name} teruggezet bij ${to.name} (de oude winkel bestaat niet meer)`;
+    }
+    opts.changes = [{ col: 'items', id, before, after }];
+  } else if (colName === 'products') {
+    const p = state.products.get(id);
+    const clash = p && productOf(p.ownerUid, p.key || productKey(p.name));
+    if (clash && clash.id !== id) return toast(`Er is al een product "${clash.name}". Hernoem of verwijder dat eerst.`);
+    opts.changes = [{ col: 'products', id, before: back, after: { deleted: false, deletedAt: null } }];
   } else {
-    change = { col: colName, id, before: { deleted: true }, after: { deleted: false } };
+    opts.changes = [{ col: colName, id, before: back, after: { deleted: false, deletedAt: null } }];
   }
-  const label = `${e.name} teruggezet uit de prullenbak`;
-  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: e.ownerUid, changes: [change] }));
+  const res = await run(() => commitCompound(state.hid, state.user, { label, ...opts }));
   if (res?.actionId) toast(label, res.actionId);
 }
 
@@ -1119,8 +1193,8 @@ async function maybePurge() {
   if (purgeDone || !state.trashReady || !ready()) return;
   purgeDone = true;
   const limit = Date.now() - TRASH_DAYS * DAY - 3600 * 1000;
-  const targets = trashEntries()
-    .filter((e) => e.at < limit)
+  const targets = trashEntries(true)
+    .filter((e) => e.at < limit && e.col !== 'line')
     .map((e) => ({ col: e.col, id: e.id }));
   if (!targets.length) return;
   try {
@@ -1128,6 +1202,23 @@ async function maybePurge() {
     console.info(`Prullenbak: ${n} definitief verwijderd`);
   } catch (err) {
     console.warn('Prullenbak opruimen mislukt:', err?.message);
+  }
+}
+
+// Regels in de prullenbak van rondes: opruimen zodra de historie geladen is.
+let linePurgeDone = false;
+async function maybePurgeLines() {
+  if (linePurgeDone || !state.tripsReady) return;
+  linePurgeDone = true;
+  const limit = Date.now() - TRASH_DAYS * DAY - 3600 * 1000;
+  for (const t of state.trips) {
+    const old = (t.removed || []).filter((l) => toMillisSafe(l.removedAt) < limit).map((l) => l.lineId);
+    if (!old.length) continue;
+    try {
+      await purgeTripLines(state.hid, t.id, old);
+    } catch (err) {
+      console.warn('Opruimen rondes mislukt:', err?.message);
+    }
   }
 }
 
@@ -1750,7 +1841,7 @@ function viewOpties() {
         <div class="row"><dt>Rol</dt><dd>${isOwner ? 'Eigenaar' : 'Lid'}</dd></div>
         <div class="row"><dt>Winkels</dt><dd class="mono">${state.stores.length}</dd></div>
         <div class="row"><dt>Secties</dt><dd class="mono">${state.sections.length}</dd></div>
-        <div class="row"><dt>Producten in geheugen</dt><dd class="mono">${state.products.size}</dd></div>
+        <div class="row"><dt>Producten in geheugen</dt><dd class="mono">${visibleProducts().length}</dd></div>
       </dl>
     </section>
 
@@ -2034,11 +2125,18 @@ function sheetTripItem(s) {
         adding
           ? ''
           : s.confirmRemove
-            ? `<div class="remove-choice">
-                <p class="muted small">${esc(s.name)} uit deze ronde halen:</p>
-                <button class="btn btn-ghost btn-block" type="button" data-action="trip-remove" data-mode="back">Terug op de lijst</button>
-                <button class="btn btn-ghost btn-block btn-danger" type="button" data-action="trip-remove" data-mode="gone">Alleen uit de historie</button>
-              </div>`
+            ? (() => {
+                const line = lineOf(t, s.lineId);
+                const back = line && t ? backStoreFor(t, line) : null;
+                const moved = back && back.id !== t.storeId;
+                return `<div class="remove-choice">
+                  <p class="muted small">${esc(s.name)} uit deze ronde halen:</p>
+                  <button class="btn btn-ghost btn-block" type="button" data-action="trip-remove" data-mode="back">Terug op de lijst${back ? ` bij ${esc(back.name)}` : ''}</button>
+                  ${moved ? `<p class="warn small">Let op: dit komt bij ${esc(back.name)} (de vaste winkel), niet bij ${esc(t.storeName)} waar deze ronde was.</p>` : ''}
+                  <button class="btn btn-ghost btn-block btn-danger" type="button" data-action="trip-remove" data-mode="gone">Alleen uit de historie</button>
+                  <p class="muted small">Alleen uit de historie: de regel gaat ${TRASH_DAYS} dagen naar de prullenbak.</p>
+                </div>`;
+              })()
             : `<button class="btn btn-ghost btn-block btn-danger" type="button" data-action="trip-remove-ask">Uit deze ronde halen</button>`
       }
     </form>`;
@@ -2082,9 +2180,10 @@ function sheetStores() {
 
 // ---------- historie: acties ----------
 
-// Keuzes die Marcel nog bevestigt (zie gesprek): waar een item heen gaat dat
-// "terug op de lijst" moet, en of een later toegevoegd item meetelt in de stats.
-const TRIP_BACK_TO = 'round'; // 'round' = winkel van die ronde, 'preferred' = vaste winkel
+// Keuzes van Marcel: "terug op de lijst" gaat naar de vaste winkel (met melding
+// als dat een andere winkel is dan die van de ronde), en een later toegevoegd
+// item telt mee in de stats.
+const TRIP_BACK_TO = 'preferred';
 const COUNT_ADDED_TO_TRIP = true;
 
 function sheetParts(s) {
@@ -2094,25 +2193,32 @@ function sheetParts(s) {
   return { qty: parts[0].qty, unit: parts[0].unit, parts: parts.length > 1 ? parts : null };
 }
 
-// Telling 'x keer gekocht bij winkel' als gewone wijziging (dus mee in undo).
-function countChange(pid, storeId, delta) {
-  const p = state.products.get(pid);
+// Telling 'x keer gekocht bij winkel' als teller (increment), ook bij undo.
+function countEffect(p, storeId, delta) {
   if (!p || !storeId) return null;
-  const before = { ...(p.storeCounts || {}) };
-  const after = { ...before, [storeId]: Math.max(0, (before[storeId] || 0) + delta) };
-  return { col: 'products', id: pid, before: { storeCounts: before }, after: { storeCounts: after } };
+  return { productId: p.id, ownerUid: p.ownerUid, path: ['storeCounts', storeId], delta };
 }
 
 function listForTrip(t) {
   return state.lists.find((l) => l.id === t.listId) || state.lists.find((l) => l.ownerUid === t.ownerUid) || null;
 }
 
+const lineOf = (t, lineId) => (t?.items || []).find((l) => l.lineId === lineId) || null;
+
+// Waar komt een regel terug op de lijst? Vaste winkel, anders die van de ronde.
+function backStoreFor(t, line) {
+  const p = liveProduct(line.productId);
+  const preferred = TRIP_BACK_TO === 'preferred' ? storeById(p?.preferredStoreId) : null;
+  return preferred || storeById(t.storeId) || storeById(p?.preferredStoreId) || state.stores[0] || null;
+}
+
 async function tripAgain(t, line) {
   const list = listForTrip(t);
   if (!list) return toast('Die lijst bestaat niet meer');
   const key = productKey(line.name);
-  const pid = line.productId && liveProduct(line.productId)?.ownerUid === list.ownerUid ? line.productId : pidFor(list.ownerUid, key);
-  const p = liveProduct(pid);
+  const known = liveProduct(line.productId)?.ownerUid === list.ownerUid ? liveProduct(line.productId) : productFor(list, key);
+  const pid = known && known.ownerUid === list.ownerUid ? known.id : pidFor(list.ownerUid, key);
+  const p = known;
   const store = storeById(p?.preferredStoreId) || storeById(t.storeId) || storeById(currentStoreId());
   if (!store) return toast('Geen winkel gevonden');
   const dup = liveItems().find((i) => i.listId === list.id && !i.checked && i.key === key);
@@ -2136,8 +2242,9 @@ async function saveTripItem() {
   const s = state.sheet;
   const t = tripById(s.tripId);
   if (!t) return closeSheet();
-  const items = t.items || [];
   const { qty, unit, parts } = sheetParts(s);
+  const tripOps = [];
+  const effects = [];
   const changes = [];
   let label;
 
@@ -2148,94 +2255,92 @@ async function saveTripItem() {
       renderSheet();
       return;
     }
-    const list = listForTrip(t) || { ownerUid: t.ownerUid };
-    const p = productFor(list, productKey(name));
+    // Alleen een product van dezelfde eigenaar: een privé-aankoop telt niet in het gedeelde geheugen.
+    const p = productOf(t.ownerUid, productKey(name));
     const line = {
       ...tripLine({ name, qty, unit, parts, productId: p?.id || null, checkedBy: state.user.uid }, state.household?.memberNames || {}),
       checkedAt: t.finishedAt || null,
       added: true,
     };
-    changes.push({ col: 'trips', id: t.id, before: { items }, after: { items: [...items, line] } });
+    tripOps.push({ tripId: t.id, op: 'add', line });
     if (COUNT_ADDED_TO_TRIP && p) {
-      const cc = countChange(p.id, t.storeId, 1);
-      if (cc) {
-        const newer = toMillisSafe(t.finishedAt) > toMillisSafe(p.lastBoughtAt);
-        if (newer) {
-          cc.before = { ...cc.before, lastBoughtAt: p.lastBoughtAt ?? null, lastBoughtStoreId: p.lastBoughtStoreId ?? null };
-          cc.after = { ...cc.after, lastBoughtAt: t.finishedAt, lastBoughtStoreId: t.storeId };
-        }
-        changes.push(cc);
+      const e = countEffect(p, t.storeId, 1);
+      if (e) effects.push(e);
+      if (toMillisSafe(t.finishedAt) > toMillisSafe(p.lastBoughtAt)) {
+        changes.push({
+          col: 'products',
+          id: p.id,
+          before: { lastBoughtAt: p.lastBoughtAt ?? null, lastBoughtStoreId: p.lastBoughtStoreId ?? null },
+          after: { lastBoughtAt: t.finishedAt, lastBoughtStoreId: t.storeId },
+        });
       }
     }
     label = `${name} toegevoegd aan ronde ${t.storeName}`;
   } else {
-    const line = items[s.idx];
-    if (!line || line.name !== s.name) return closeSheet();
-    const next = { ...line, qty, unit, parts };
-    if (JSON.stringify(next) === JSON.stringify(line)) return closeSheet();
-    changes.push({ col: 'trips', id: t.id, before: { items }, after: { items: items.map((x, i) => (i === s.idx ? next : x)) } });
+    const line = lineOf(t, s.lineId);
+    if (!line) return closeSheet();
+    const after = { qty, unit, parts };
+    if (JSON.stringify({ qty: line.qty ?? null, unit: line.unit ?? null, parts: line.parts ?? null }) === JSON.stringify(after)) return closeSheet();
+    tripOps.push({ tripId: t.id, op: 'edit', lineId: line.lineId, after });
     label = `${line.name} aangepast in ronde ${t.storeName}`;
   }
   closeSheet();
-  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: t.ownerUid, changes }));
+  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: t.ownerUid, tripOps, effects, changes }));
   if (res?.actionId) toast(label, res.actionId);
 }
 
 const toMillisSafe = (ts) => (ts?.toMillis ? ts.toMillis() : Number(ts) || 0);
 
+// mode 'back' = terug op de lijst; 'gone' = alleen uit de historie (naar de prullenbak).
 async function removeFromTrip(mode) {
   const s = state.sheet;
   const t = tripById(s.tripId);
-  const items = t?.items || [];
-  const line = items[s.idx];
+  const line = lineOf(t, s.lineId);
   closeSheet();
-  if (!t || !line || line.name !== s.name) return;
-  const changes = [{ col: 'trips', id: t.id, before: { items }, after: { items: items.filter((_, i) => i !== s.idx) } }];
+  if (!t || !line) return;
+  const tripOps = [{ tripId: t.id, op: 'remove', lineId: line.lineId, toTrash: mode === 'gone' }];
+  const effects = [];
   const creates = [];
-  if (line.productId && (!line.added || COUNT_ADDED_TO_TRIP)) {
-    const cc = countChange(line.productId, t.storeId, -1);
-    if (cc) changes.push(cc);
+  const p = line.productId ? state.products.get(line.productId) : null;
+  if (p?.name && (!line.added || COUNT_ADDED_TO_TRIP)) {
+    const e = countEffect(p, t.storeId, -1);
+    if (e) effects.push(e);
   }
-  let note = '';
+  let note = mode === 'gone' ? ' (in de prullenbak)' : '';
   if (mode === 'back') {
     const list = listForTrip(t);
     const key = productKey(line.name);
     const dup = list && liveItems().find((i) => i.listId === list.id && !i.checked && i.key === key);
+    const store = backStoreFor(t, line);
     if (!list) note = ' (lijst bestaat niet meer)';
-    else if (dup) note = ` (stond al op de lijst)`;
-    else {
-      const p = liveProduct(line.productId);
-      const store = (TRIP_BACK_TO === 'preferred' && storeById(p?.preferredStoreId)) || storeById(t.storeId) || storeById(p?.preferredStoreId) || state.stores[0];
-      if (store) {
-        creates.push({
-          col: 'items',
-          data: newItemDoc(state.user, list, {
-            name: line.name,
-            key,
-            qty: line.qty,
-            unit: line.unit,
-            parts: line.parts,
-            storeId: store.id,
-            sectionId: resolveSection(p, store, line.name),
-          }, p ? p.id : null),
-          before: { deleted: true, archived: true },
-          after: { deleted: false, archived: false },
-        });
-        note = ` → terug op de lijst bij ${store.name}`;
-      }
+    else if (dup) note = ' (stond al op de lijst)';
+    else if (store) {
+      const live = liveProduct(line.productId);
+      creates.push({
+        col: 'items',
+        data: newItemDoc(
+          state.user,
+          list,
+          { name: line.name, key, qty: line.qty, unit: line.unit, parts: line.parts, storeId: store.id, sectionId: resolveSection(live, store, line.name) },
+          live ? live.id : null,
+        ),
+        before: { deleted: true, archived: true },
+        after: { deleted: false, archived: false },
+      });
+      note = store.id !== t.storeId ? ` → terug op de lijst bij ${store.name} (niet ${t.storeName})` : ` → terug op de lijst bij ${store.name}`;
     }
   }
   const label = `${line.name} uit ronde ${t.storeName} gehaald${note}`;
-  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: t.ownerUid, creates, changes }));
+  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: t.ownerUid, creates, effects, tripOps }));
   if (res?.actionId) toast(label, res.actionId);
 }
 
 // ---------- producten: acties ----------
 
-// Nog te bevestigen door Marcel: hernoemen ook op de lijst doorvoeren, en of
-// open items meegaan naar de prullenbak als je het product verwijdert.
+// Keuzes van Marcel: hernoemen geldt ook voor wat op de lijst staat, en bij
+// verwijderen gaan open items mee naar de prullenbak (met waarschuwing vooraf).
 const RENAME_OPEN_ITEMS = true;
-const TRASH_OPEN_ITEMS = false;
+const TRASH_OPEN_ITEMS = true;
 
 async function saveProduct() {
   const sh = state.sheet;
@@ -2288,13 +2393,12 @@ async function trashProduct() {
   closeSheet();
   if (!p) return;
   const now = nowTs();
-  const changes = [{ col: 'products', id: p.id, before: { deleted: false }, after: { deleted: true, deletedAt: now } }];
-  if (TRASH_OPEN_ITEMS) {
-    for (const i of liveItems().filter((x) => x.productId === p.id)) {
-      changes.push({ col: 'items', id: i.id, before: { deleted: false, archived: false }, after: { deleted: true, archived: true, deletedAt: now } });
-    }
+  const changes = [{ col: 'products', id: p.id, before: { deleted: false, deletedAt: null }, after: { deleted: true, deletedAt: now } }];
+  const open = TRASH_OPEN_ITEMS ? liveItems().filter((x) => x.productId === p.id) : [];
+  for (const i of open) {
+    changes.push({ col: 'items', id: i.id, before: { deleted: false, archived: false, deletedAt: null }, after: { deleted: true, archived: true, deletedAt: now } });
   }
-  const label = `${p.name} naar de prullenbak`;
+  const label = `${p.name} naar de prullenbak${open.length ? ` (met ${open.length} ${open.length === 1 ? 'item' : 'items'} van de lijst)` : ''}`;
   const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: p.ownerUid, changes }));
   if (res?.actionId) toast(label, res.actionId);
 }
@@ -2337,8 +2441,8 @@ async function doFinish(listId, storeId, choices) {
     if (c.choice !== 'forward') return { item, choice: c.choice };
     const to = storeById(c.storeId);
     if (!to) return { item, choice: 'stay' };
-    const product = state.products.get(item.productId) || null;
-    return { item, choice: 'forward', storeId: to.id, sectionId: resolveSection(product, to, item.name) };
+    const product = liveProduct(item.productId);
+    return { item, choice: 'forward', storeId: to.id, sectionId: resolveSection(product, to, item.name), productLive: productExists(item.productId) };
   });
 
   // 'Iedere keer': direct weer op de lijst, bij de vaste winkel van het product.
@@ -2376,7 +2480,7 @@ async function doFinish(listId, storeId, choices) {
   const products = [];
   for (const i of checked) {
     const p = state.products.get(i.productId);
-    if (!p || seen.has(p.id)) continue;
+    if (!p?.name || seen.has(p.id)) continue;
     seen.add(p.id);
     products.push({ id: p.id, before: { lastBoughtAt: p.lastBoughtAt ?? null, lastBoughtStoreId: p.lastBoughtStoreId ?? null } });
   }
@@ -2451,16 +2555,21 @@ function pidFor(ownerUid, key) {
   if (live) return live.id;
   const base = productIdFor(ownerUid, key);
   const taken = state.products.get(base);
-  if (!taken || taken.deleted || (taken.key || key) === key) return base;
+  // Vrij, of een naamloos restje (alleen tellers): mag gebruikt worden.
+  // Ligt er een product in de prullenbak: dat laten we met rust (terugzetten blijft kunnen).
+  if (!taken || (!taken.name && !taken.deleted)) return base;
   return `${base}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
 // Meegeven aan addItem: nieuw product, of een verwijderd product dat opnieuw begint.
 function productArg(pid, extra = {}) {
   const existing = state.products.get(pid);
-  if (existing && !existing.deleted) return { id: pid, isNew: false };
-  return { id: pid, isNew: true, reset: !!existing, ...extra };
+  if (existing && !existing.deleted && existing.name) return { id: pid, isNew: false };
+  return { id: pid, isNew: true, ...extra };
 }
+
+// Bestaat het productdocument nog (ook in de prullenbak)? Dan mag een teller erop.
+const productExists = (id) => !!id && !!state.products.get(id)?.name;
 
 async function quickAdd(text) {
   const list = activeList();
@@ -2569,14 +2678,21 @@ async function saveSheetItem() {
     productUpdates = { id: pid, data };
   }
   if (!item.productId && !changes.productId) changes.productId = pid;
-  const wasRecurring = !!state.products.get(pid)?.recurring;
-  if (!!s.recurring !== wasRecurring) {
-    productUpdates ||= { id: pid, data: { name, key } };
-    productUpdates.data.recurring = !!s.recurring;
+  // 'Iedere keer' als losse wijziging, zodat undo hem ook terugzet.
+  const extraChanges = [];
+  const existing = state.products.get(pid);
+  if (!!s.recurring !== !!existing?.recurring) {
+    if (existing?.name) extraChanges.push({ col: 'products', id: pid, before: { recurring: !!existing.recurring }, after: { recurring: !!s.recurring } });
+    else {
+      productUpdates ||= { id: pid, data: { name, key } };
+      productUpdates.data.recurring = !!s.recurring;
+    }
   }
-  if (!Object.keys(changes).length && !productUpdates) return;
+  if (!Object.keys(changes).length && !productUpdates && !extraChanges.length) return;
 
-  const actionId = await run(() => updateItem(state.hid, state.user, item, changes, productUpdates));
+  const actionId = await run(() =>
+    updateItem(state.hid, state.user, item, changes, productUpdates, { productLive: productExists(changes.productId || item.productId), extraChanges }),
+  );
   if (actionId) {
     toast(changes.storeId ? `${name} → ${storeById(changes.storeId)?.name}` : `${name} aangepast`, actionId);
   }
@@ -2901,7 +3017,7 @@ document.addEventListener('click', async (e) => {
     case 'toggle': {
       const item = state.items.find((i) => i.id === id);
       if (!item) break;
-      const actionId = await run(() => setItemChecked(state.hid, state.user, item, !item.checked));
+      const actionId = await run(() => setItemChecked(state.hid, state.user, item, !item.checked, productExists(item.productId)));
       if (actionId) toast(`${item.name} ${item.checked ? 'teruggezet' : 'afgevinkt'}`, actionId);
       break;
     }
@@ -2926,6 +3042,12 @@ document.addEventListener('click', async (e) => {
     case 'product-open':
       openProductSheet(id);
       break;
+    case 'product-delete-ask':
+      if (state.sheet) {
+        state.sheet.confirmDelete = true;
+        renderSheet();
+      }
+      break;
     case 'product-delete':
       await trashProduct();
       break;
@@ -2935,20 +3057,19 @@ document.addEventListener('click', async (e) => {
       break;
     case 'trip-again': {
       const t = tripById(id);
-      const line = t?.items?.[Number(el.dataset.idx)];
+      const line = lineOf(t, el.dataset.line);
       if (line) await tripAgain(t, line);
       break;
     }
     case 'trip-item-edit': {
       const t = tripById(id);
-      const idx = Number(el.dataset.idx);
-      const line = t?.items?.[idx];
+      const line = lineOf(t, el.dataset.line);
       if (!line) break;
       openSheet({
         mode: 'trip-item',
         title: `${line.name} aanpassen`,
         tripId: t.id,
-        idx,
+        lineId: line.lineId,
         name: line.name,
         parts:
           Array.isArray(line.parts) && line.parts.length > 1

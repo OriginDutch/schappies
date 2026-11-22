@@ -305,6 +305,29 @@ function sectionsForStore(store) {
   const off = new Set(store?.disabledSectionIds || []);
   return sectionsForStoreAll(store).filter((s) => isOverig(s) || !off.has(s.id));
 }
+// Keuzelijst met secties in looproute-volgorde: gangpaden als kopjes, daarna
+// wat nog niet is ingedeeld, en Overig altijd onderaan.
+function sectionOptions(store, selectedId) {
+  const opt = (sec) => `<option value="${sec.id}"${sec.id === selectedId ? ' selected' : ''}>${esc(sec.name)}</option>`;
+  const avail = sectionsForStore(store);
+  const overig = avail.filter(isOverig);
+  const rest = avail.filter((x) => !isOverig(x));
+  const layout = storeLayout(store).filter((g) => g.sectionIds.length);
+  if (!layout.length) return [...rest, ...overig].map(opt).join('');
+  const placed = new Set();
+  const parts = layout.map((g) => {
+    const secs = g.sectionIds.map(sectionById).filter((x) => x && !isOverig(x) && !placed.has(x.id));
+    secs.forEach((x) => placed.add(x.id));
+    if (!secs.length) return '';
+    // Blok met één sectie van dezelfde naam (bijv. "Fruit"): geen kopje nodig.
+    if (secs.length === 1 && secs[0].name.toLocaleLowerCase('nl') === String(g.name || '').toLocaleLowerCase('nl')) return opt(secs[0]);
+    return `<optgroup label="${esc(g.name || 'Blok')}">${secs.map(opt).join('')}</optgroup>`;
+  });
+  const loose = rest.filter((x) => !placed.has(x.id));
+  if (loose.length) parts.push(`<optgroup label="Niet ingedeeld">${loose.map(opt).join('')}</optgroup>`);
+  return parts.join('') + overig.map(opt).join('');
+}
+
 const sectionAvailable = (store, id) => !!id && sectionsForStore(store).some((s) => s.id === id);
 
 // Een sectie die hier niet bestaat, tonen onder wat er hier voor die categorie is.
@@ -970,7 +993,7 @@ function productChainRows(p, sh) {
       return `<div class="field">
         <label class="field-label" for="pc-${c.id}">Sectie bij ${esc(c.name)}</label>
         <select id="pc-${c.id}" class="input" data-product-chain="${c.id}">
-          ${sectionsForStore(store).map((sec) => `<option value="${sec.id}"${sec.id === current ? ' selected' : ''}>${esc(sec.name)}</option>`).join('')}
+          ${sectionOptions(store, current)}
         </select>
       </div>`;
     })
@@ -1013,7 +1036,9 @@ function sheetProductEdit(sh) {
       <div class="field">
         <label class="field-label" for="pp-section">Algemene sectie</label>
         <select id="pp-section" class="input" data-field="generalSectionId">
-          ${general.map((x) => `<option value="${x.id}"${x.id === sh.generalSectionId ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}
+          ${[...general.filter((x) => !isOverig(x)), ...general.filter(isOverig)]
+            .map((x) => `<option value="${x.id}"${x.id === sh.generalSectionId ? ' selected' : ''}>${esc(x.name)}</option>`)
+            .join('')}
         </select>
       </div>
       ${productChainRows(p, sh)}
@@ -1979,9 +2004,7 @@ function sheetItem(s) {
       <div class="field">
         <label class="field-label" for="sheet-section">Sectie${store ? ` bij ${esc(store.name)}` : ''}</label>
         <select id="sheet-section" class="input" data-field="sectionId">
-          ${sectionsForStore(store)
-            .map((sec) => `<option value="${sec.id}"${sec.id === s.sectionId ? ' selected' : ''}>${esc(sec.name)}</option>`)
-            .join('')}
+          ${sectionOptions(store, s.sectionId)}
           <option value="__new__">+ Nieuwe sectie…</option>
         </select>
         ${

@@ -641,7 +641,8 @@ function currentStoreId() {
   if (chosen && storeById(chosen)) return chosen;
   const counts = storeCounts(listItems(list));
   const withOpen = state.stores.find((s) => counts[s.id]?.open > 0);
-  return (withOpen || state.stores[0]).id;
+  const withItems = state.stores.find((s) => counts[s.id]?.total > 0);
+  return (withOpen || withItems || state.stores[0]).id;
 }
 
 function latestUndoable() {
@@ -751,7 +752,9 @@ function viewLijst() {
   const total = inStore.length;
   const pct = total ? Math.round((cart.length / total) * 100) : 0;
 
-  const barStores = state.stores.filter((s) => counts[s.id]?.open > 0 || s.id === storeId);
+  // Een winkel blijft in de balk zolang er iets op staat (ook alles afgevinkt),
+  // anders kom je niet meer bij "Ronde afronden".
+  const barStores = state.stores.filter((s) => counts[s.id]?.total > 0 || s.id === storeId);
   const hidden = state.stores.length - barStores.length;
 
   const ordered = groupForStore(store, open);

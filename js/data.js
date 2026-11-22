@@ -550,6 +550,46 @@ export async function addSection(hid, user, { name, chainId, parentKey, order })
   return { sectionId: sRef.id, actionId };
 }
 
+// Indeling importeren in één batch: nieuwe secties + looproute (+ secties weer aanzetten).
+// newSections: [{ tempId, name, parentKey, order }] — tempId komt in de layout voor
+// en wordt hier vervangen door het echte id. Eén regel in het log, in één keer ongedaan te maken.
+export async function importLayout(hid, user, { store, chainId, newSections, layout, enableIds, label }) {
+  const batch = writeBatch(db);
+  const idMap = {};
+  const changes = [];
+  for (const s of newSections) {
+    const sRef = doc(col(hid, 'sections'));
+    idMap[s.tempId] = sRef.id;
+    batch.set(sRef, {
+      schemaVersion: SCHEMA_VERSION,
+      name: s.name,
+      custom: true,
+      storeId: null,
+      chainId: chainId || null,
+      parentKey: s.parentKey || 'overig',
+      order: s.order,
+      deleted: false,
+      createdAt: serverTimestamp(),
+      createdBy: user.uid,
+      updatedAt: serverTimestamp(),
+      updatedBy: user.uid,
+    });
+    changes.push({ col: 'sections', id: sRef.id, before: { deleted: true }, after: { deleted: false } });
+  }
+  const finalLayout = layout.map((g) => ({ ...g, sectionIds: g.sectionIds.map((id) => idMap[id] || id) }));
+  const before = { layout: store.layout || [] };
+  const after = { layout: finalLayout };
+  if (enableIds?.length) {
+    before.disabledSectionIds = store.disabledSectionIds || [];
+    after.disabledSectionIds = (store.disabledSectionIds || []).filter((id) => !enableIds.includes(id));
+  }
+  batch.update(ref(hid, 'stores', store.id), { ...after, updatedAt: serverTimestamp(), updatedBy: user.uid });
+  changes.push({ col: 'stores', id: store.id, before, after });
+  const actionId = logAction(batch, hid, user, { type: 'compound', label, changes });
+  await batch.commit();
+  return actionId;
+}
+
 // Volgorde opslaan (geen undo: cosmetisch en direct terug te zetten).
 export async function setSectionOrder(hid, user, orderedIds) {
   const batch = writeBatch(db);

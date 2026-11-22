@@ -130,3 +130,68 @@ export function guessParentKey(sectionName) {
   }
   return guessSectionKey(sectionName);
 }
+
+// ---------- indeling importeren ----------
+
+// "Gangpad 1: brood, pasta" → { name: 'Gangpad 1', items: ['Brood', 'Pasta'] }
+// "Fruit"                   → { name: 'Fruit', items: ['Fruit'] }
+export function parseLayoutText(text) {
+  const blocks = [];
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.trim().replace(/^[-*•]\s*/, '');
+    if (!line) continue;
+    const i = line.indexOf(':');
+    if (i === -1) {
+      blocks.push({ name: capitalize(line), items: [capitalize(line)] });
+      continue;
+    }
+    const name = capitalize(line.slice(0, i).trim()) || `Blok ${blocks.length + 1}`;
+    const items = line
+      .slice(i + 1)
+      .split(/[,;]/)
+      .map((s) => capitalize(s.trim().replace(/\s+/g, ' ')))
+      .filter(Boolean);
+    blocks.push({ name, items });
+  }
+  return blocks.filter((b) => b.items.length);
+}
+
+const normName = (s) =>
+  String(s || '')
+    .toLocaleLowerCase('nl')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]+/g, '');
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let last = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, last + (a[i - 1] === b[j - 1] ? 0 : 1));
+      last = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
+const sim = (a, b) => (a && b ? 1 - levenshtein(a, b) / Math.max(a.length, b.length) : 0);
+
+// Hoe goed lijkt een getypte naam op een bestaande sectienaam (0..1)?
+// Vangt typfouten ("verzorginf") en deelnamen ("snoep" ↔ "Snoep/Snacks").
+export function nameSimilarity(typed, existing) {
+  const a = normName(typed);
+  const b = normName(existing);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  let best = sim(a, b);
+  const parts = String(existing)
+    .split(/[^a-zA-Zà-ÿ0-9]+/)
+    .map(normName)
+    .filter((p) => p.length >= 3);
+  for (const p of parts) best = Math.max(best, sim(a, p) * 0.95);
+  return best;
+}

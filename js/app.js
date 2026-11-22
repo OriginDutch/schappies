@@ -34,9 +34,20 @@ import {
   setSectionOrder,
   watchChains,
   migrateToChains,
+  importLayout,
   DEFAULT_SECTIONS,
 } from './data.js';
-import { UNITS, parseQuickAdd, productKey, guessSectionKey, guessParentKey, formatQty, capitalize } from './parse.js';
+import {
+  UNITS,
+  parseQuickAdd,
+  productKey,
+  guessSectionKey,
+  guessParentKey,
+  formatQty,
+  capitalize,
+  parseLayoutText,
+  nameSimilarity,
+} from './parse.js';
 import { initTheme, getThemePref, setThemePref } from './theme.js';
 
 const APP_VERSION = self.APP_VERSION || 'dev';
@@ -61,6 +72,7 @@ const state = {
   renamingStoreId: null,
   layoutStoreId: null,
   layoutNewSection: null,
+  importDraft: null,
   optSub: null,
   allSections: [],
   chains: [],
@@ -692,8 +704,12 @@ function viewLayout(store) {
       </div>
     </details>
 
-    <h2 class="section-heading">Looproute</h2>
+    <div class="card-head">
+      <h2 class="section-heading">Looproute</h2>
+      ${state.importDraft?.storeId === store.id ? '' : `<button class="btn btn-ghost btn-sm" data-action="import-open">Indeling plakken</button>`}
+    </div>
     <p class="muted">Zet de blokken in de volgorde waarin je door de winkel loopt. Een blok kan een gangpad zijn, maar ook "Koeling" of "Bij de kassa".</p>
+    ${state.importDraft?.storeId === store.id ? importCard(store) : ''}
 
     ${layout
       .map(
@@ -755,6 +771,150 @@ function viewLayout(store) {
           </section>`
         : `<p class="muted small center">Alle secties hebben een plek.</p>`
     }`;
+}
+
+// ---------- indeling importeren ----------
+
+const IMPORT_MATCH = 0.75;
+
+// Voorbeeld opbouwen: per getypte naam de beste bestaande secties bij deze winkel.
+function buildImportPreview(store, text) {
+  const blocks = parseLayoutText(text);
+  const pool = sectionsForStoreAll(store);
+  return blocks.map((b, bi) => ({
+    name: b.name,
+    rows: b.items.map((typed, ii) => {
+      const ranked = pool
+        .map((s) => ({ id: s.id, name: s.name, score: nameSimilarity(typed, s.name) + (s.custom ? 0.01 : 0) }))
+        .filter((c) => c.score >= 0.5)
+        .sort((x, y) => y.score - x.score)
+        .slice(0, 4);
+      const best = ranked[0];
+      return {
+        key: `${bi}:${ii}`,
+        typed,
+        candidates: ranked,
+        choice: best && best.score >= IMPORT_MATCH ? best.id : 'new',
+        parentKey: guessParentKey(typed),
+      };
+    }),
+  }));
+}
+
+function importCard(store) {
+  const d = state.importDraft;
+  const chain = chainOf(store);
+  if (!d.preview) {
+    return `
+      <section class="card import-card">
+        <h2 class="card-title">Indeling plakken</h2>
+        <p class="muted small">Eén blok per regel. Zonder dubbele punt wordt de regel een blok met één sectie.</p>
+        <pre class="import-example mono">Fruit
+Gangpad 1: brood, pasta, soep
+Koeling: koeling (zuivel), koeling (vlees)</pre>
+        <label class="sr-only" for="import-text">Indeling</label>
+        <textarea id="import-text" class="input import-text" data-import-text rows="9" placeholder="Plak hier je indeling">${esc(d.text || '')}</textarea>
+        ${d.error ? `<p class="error" role="alert">${esc(d.error)}</p>` : ''}
+        <div class="inline-form">
+          <button class="btn btn-primary" data-action="import-preview">Bekijken</button>
+          <button class="btn btn-ghost" data-action="import-cancel">Annuleren</button>
+        </div>
+      </section>`;
+  }
+  const rows = d.preview.flatMap((b) => b.rows);
+  const seen = new Set();
+  const dupes = new Set();
+  for (const r of rows) {
+    if (r.choice === 'skip' || r.choice === 'new') continue;
+    if (seen.has(r.choice)) dupes.add(r.key);
+    seen.add(r.choice);
+  }
+  const nNew = rows.filter((r) => r.choice === 'new').length;
+  const nMatch = rows.filter((r) => r.choice !== 'new' && r.choice !== 'skip').length;
+  return `
+    <section class="card import-card">
+      <h2 class="card-title">Voorbeeld</h2>
+      <p class="muted small">${nMatch} gekoppeld aan bestaande secties · ${nNew} nieuw${chain ? ` (voor ${esc(chain.name)})` : ''}. Kies per regel waar hij bij hoort.</p>
+      ${d.preview
+        .map(
+          (b, bi) => `
+        <div class="import-block">
+          <h3 class="chain-group-title"><span class="layout-num mono">${bi + 1}</span> ${esc(b.name)}</h3>
+          ${b.rows
+            .map((r) => {
+              const exact = r.candidates[0] && r.candidates[0].score >= 1 && r.choice === r.candidates[0].id;
+              return `
+            <div class="import-row${dupes.has(r.key) ? ' is-dupe' : ''}">
+              <span class="import-typed">${esc(r.typed)}</span>
+              <label class="sr-only" for="ir-${r.key}">Koppeling voor ${esc(r.typed)}</label>
+              <select id="ir-${r.key}" class="input import-select${exact ? ' is-exact' : ''}" data-import-row="${r.key}">
+                ${r.candidates
+                  .map((c) => `<option value="${c.id}"${c.id === r.choice ? ' selected' : ''}>→ ${esc(c.name)}</option>`)
+                  .join('')}
+                <option value="new"${r.choice === 'new' ? ' selected' : ''}>+ Nieuw: ${esc(r.typed)} (onder ${esc(sectionByKey(r.parentKey)?.name || 'Overig')})</option>
+                <option value="skip"${r.choice === 'skip' ? ' selected' : ''}>Overslaan</option>
+              </select>
+              ${dupes.has(r.key) ? '<span class="muted small">staat al eerder in de lijst, alleen de eerste telt</span>' : ''}
+            </div>`;
+            })
+            .join('')}
+        </div>`,
+        )
+        .join('')}
+      <label class="check-row"><input type="checkbox" data-import-replace${d.replace ? ' checked' : ''}> Huidige looproute vervangen (anders komt dit erachter)</label>
+      <div class="inline-form">
+        <button class="btn btn-primary" data-action="import-apply">Toepassen</button>
+        <button class="btn btn-ghost" data-action="import-back">Tekst aanpassen</button>
+        <button class="btn btn-ghost" data-action="import-cancel">Annuleren</button>
+      </div>
+      <p class="muted small">Na toepassen is alles gewoon aan te passen, en in één keer ongedaan te maken.</p>
+    </section>`;
+}
+
+async function applyImport(store) {
+  const d = state.importDraft;
+  const used = new Set();
+  const newByName = new Map();
+  const newSections = [];
+  let order = nextSectionOrder();
+  const blocks = d.preview
+    .map((b) => {
+      const ids = [];
+      for (const r of b.rows) {
+        if (r.choice === 'skip') continue;
+        let id = r.choice;
+        if (id === 'new') {
+          const k = r.typed.toLocaleLowerCase('nl');
+          if (!newByName.has(k)) {
+            const tempId = `new_${newSections.length}`;
+            newSections.push({ tempId, name: r.typed.slice(0, 40), parentKey: r.parentKey, order: order++ });
+            newByName.set(k, tempId);
+          }
+          id = newByName.get(k);
+        }
+        if (used.has(id)) continue;
+        used.add(id);
+        ids.push(id);
+      }
+      return { id: newGroupId(), name: b.name.slice(0, 40), sectionIds: ids };
+    })
+    .filter((g) => g.sectionIds.length);
+
+  // Erachter plakken: bestaande blokken houden, maar zonder secties die nu een nieuwe plek krijgen.
+  const layout = d.replace
+    ? blocks
+    : [...storeLayout(store).map((g) => ({ ...g, sectionIds: g.sectionIds.filter((id) => !used.has(id)) })), ...blocks];
+  const off = new Set(store.disabledSectionIds || []);
+  const enableIds = [...used].filter((id) => off.has(id));
+  const label = `Indeling ${store.name} geïmporteerd (${blocks.length} blokken${newSections.length ? `, ${newSections.length} ${newSections.length === 1 ? 'nieuwe sectie' : 'nieuwe secties'}` : ''})`;
+  const actionId = await run(() =>
+    importLayout(state.hid, state.user, { store, chainId: store.chainId, newSections, layout, enableIds, label }),
+  );
+  if (actionId) {
+    state.importDraft = null;
+    toast(label, actionId);
+    render();
+  }
 }
 
 async function saveLayout(store, layout, label) {
@@ -1539,6 +1699,7 @@ document.addEventListener('click', async (e) => {
     state.renamingStoreId = null;
     state.layoutStoreId = null;
     state.layoutNewSection = null;
+    state.importDraft = null;
     state.optSub = null;
     state.chainView = null;
     render();
@@ -1765,8 +1926,41 @@ document.addEventListener('click', async (e) => {
     case 'layout-back':
       state.layoutStoreId = null;
       state.layoutNewSection = null;
+      state.importDraft = null;
       render();
       break;
+    case 'import-open':
+      state.importDraft = { storeId: state.layoutStoreId, text: '', preview: null, replace: true, error: '' };
+      render();
+      document.getElementById('import-text')?.focus();
+      break;
+    case 'import-cancel':
+      state.importDraft = null;
+      render();
+      break;
+    case 'import-back':
+      if (state.importDraft) state.importDraft.preview = null;
+      render();
+      break;
+    case 'import-preview': {
+      const st = storeById(state.layoutStoreId);
+      const dr = state.importDraft;
+      if (!st || !dr) break;
+      const preview = buildImportPreview(st, dr.text);
+      if (!preview.length) {
+        dr.error = 'Geen blokken gevonden. Zet elk blok op een eigen regel.';
+      } else {
+        dr.error = '';
+        dr.preview = preview;
+      }
+      render();
+      break;
+    }
+    case 'import-apply': {
+      const st = storeById(state.layoutStoreId);
+      if (st && state.importDraft?.preview) await applyImport(st);
+      break;
+    }
     case 'layout-add-group': {
       const store = storeById(state.layoutStoreId);
       if (!store) break;
@@ -1833,6 +2027,18 @@ document.addEventListener('click', async (e) => {
 
 document.addEventListener('change', async (e) => {
   const t = e.target;
+
+  // Indeling importeren: keuze per regel en vervangen/erachter.
+  if (t.dataset.importRow && state.importDraft?.preview) {
+    const row = state.importDraft.preview.flatMap((b) => b.rows).find((r) => r.key === t.dataset.importRow);
+    if (row) row.choice = t.value;
+    render();
+    return;
+  }
+  if (t.dataset.importReplace !== undefined && state.importDraft) {
+    state.importDraft.replace = t.checked;
+    return;
+  }
 
   // Item-sheet: sectie kiezen of een nieuwe maken.
   if (state.sheet && t.dataset.field === 'sectionId') {
@@ -1967,6 +2173,10 @@ document.addEventListener('change', async (e) => {
 });
 
 document.addEventListener('input', (e) => {
+  if (e.target.dataset?.importText !== undefined && state.importDraft) {
+    state.importDraft.text = e.target.value;
+    return;
+  }
   const field = e.target.dataset?.field;
   if (field === 'sectionId' || field === 'newSectionOnlyStore') return;
   if (field && state.sheet) state.sheet[field] = e.target.value;

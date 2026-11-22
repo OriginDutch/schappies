@@ -1268,6 +1268,85 @@ details.card[open] > summary::after {
   margin-right: 0;
 }
 
+/* ---------- indeling importeren ---------- */
+
+.import-card {
+  border-color: var(--accent);
+}
+
+.import-example {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: 13px;
+  white-space: pre-wrap;
+  color: var(--muted);
+}
+
+.import-text {
+  height: auto;
+  min-height: 180px;
+  padding: 12px 14px;
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.import-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--divider);
+}
+
+.import-block .chain-group-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text);
+  text-transform: none;
+}
+
+.import-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+}
+
+@media (min-width: 560px) {
+  .import-row {
+    grid-template-columns: minmax(0, 200px) minmax(0, 1fr);
+    align-items: center;
+  }
+
+  .import-row .muted {
+    grid-column: 2;
+  }
+}
+
+.import-typed {
+  font-size: 14px;
+}
+
+.import-select {
+  height: 42px;
+  font-size: 14px;
+}
+
+.import-select.is-exact {
+  border-color: transparent;
+  background-color: var(--surface-2);
+}
+
+.import-row.is-dupe .import-typed {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
 /* ---------- desktop ---------- */
 
 @media (min-width: 900px) {

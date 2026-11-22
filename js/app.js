@@ -163,6 +163,7 @@ const ICONS = {
   x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
   back: '<path d="m15 18-6-6 6-6"/>',
   next: '<path d="m9 18 6-6-6-6"/>',
+  forward: '<path d="M5 12h14"/><path d="m13 6 6 6-6 6"/>',
 };
 const icon = (name, size = 20) =>
   `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
@@ -598,7 +599,9 @@ function renderNav() {
     <div class="nav-household">${esc(state.household?.name || '')}</div>
     ${NAV.map(
       (n) => `<button class="nav-item${state.view === n.id ? ' is-active' : ''}" data-nav="${n.id}"
-        ${state.view === n.id ? 'aria-current="page"' : ''}>${n.label}</button>`,
+        ${state.view === n.id ? 'aria-current="page"' : ''}>${n.label}${
+          n.id === 'producten' && allSuggestions().length ? '<span class="nav-dot" aria-label="suggesties"></span>' : ''
+        }</button>`,
     ).join('')}`;
 }
 
@@ -676,13 +679,14 @@ function latestUndoable() {
 function itemRow(item) {
   const qty = formatItemQty(item);
   return `
-    <div class="item${item.checked ? ' is-checked' : ''}">
+    <div class="item${item.checked ? ' is-checked' : ''}" data-swipe="${item.id}">
       <button class="item-main" data-action="toggle" data-id="${item.id}"
         aria-label="${esc(item.name)} ${item.checked ? 'terugzetten' : 'afvinken'}">
         <span class="check" aria-hidden="true">${item.checked ? icon('check', 13) : ''}</span>
         <span class="item-name">${esc(item.name)}</span>
         ${qty ? `<span class="item-qty">${esc(qty)}</span>` : ''}
       </button>
+      ${item.checked ? '' : `<button class="icon-btn icon-btn-quiet fwd-btn" data-action="forward-item" data-id="${item.id}" aria-label="${esc(item.name)} doorsturen">${icon('forward', 18)}</button>`}
       <button class="icon-btn icon-btn-quiet" data-action="edit-item" data-id="${item.id}" aria-label="${esc(item.name)} bewerken">${icon('edit', 18)}</button>
     </div>`;
 }
@@ -810,6 +814,8 @@ function viewLijst() {
         <button class="icon-btn" data-action="stores-sheet" aria-label="Alle winkels${hidden ? ` (${hidden} zonder items)` : ''}">${icon('more')}</button>
       </div>
     </header>
+
+    ${suggestionsCard()}
 
     ${
       total && !open.length
@@ -976,6 +982,7 @@ function viewProducten() {
   const n = visibleProducts().length;
   return `
     <header class="page-head"><h1 class="page-title">Producten</h1><span class="muted mono small">${n}</span></header>
+    ${suggestionsCard()}
     <div class="product-search">
       <label class="sr-only" for="product-search">Zoeken</label>
       <input id="product-search" class="input" type="search" data-product-search value="${esc(state.productQuery)}" placeholder="Zoeken…" autocomplete="off" autocapitalize="off">
@@ -1043,6 +1050,7 @@ function sheetProductEdit(sh) {
       </div>
       ${productChainRows(p, sh)}
       <label class="check-row"><input type="checkbox" data-field="recurring"${sh.recurring ? ' checked' : ''}> Iedere keer op de lijst</label>
+      <label class="check-row"><input type="checkbox" data-field="suggest"${sh.suggest ? ' checked' : ''}> Suggesties voor vaste winkel</label>
       ${sh.error ? `<p class="error" role="alert">${esc(sh.error)}</p>` : ''}
       <button class="btn btn-primary btn-block" type="submit">Opslaan</button>
       ${
@@ -1085,6 +1093,7 @@ function openProductSheet(pid) {
     chainSections,
     chainTouched: {},
     recurring: !!p.recurring,
+    suggest: !p.suggestOff,
   });
 }
 
@@ -1922,6 +1931,11 @@ function openSheet(sheet) {
 }
 
 function closeSheet() {
+  // Suggestie-vraag weggeklikt zonder antwoord: het item toch toevoegen.
+  const sh = state.sheet;
+  if (sh?.mode === 'suggest' && sh.pendingAdd && !sh.answered) {
+    setTimeout(() => quickAdd(sh.pendingAdd.text, { skipSuggest: true }), 0);
+  }
   state.sheet = null;
   document.getElementById('sheet-root').innerHTML = '';
   document.body.classList.remove('sheet-open');
@@ -1948,7 +1962,11 @@ function renderSheet() {
               ? sheetTripItem(s)
               : s.mode === 'product'
                 ? sheetProductEdit(s)
-                : sheetItem(s);
+                : s.mode === 'forward'
+                  ? sheetForward(s)
+                  : s.mode === 'suggest'
+                    ? sheetSuggest(s)
+                    : sheetItem(s);
   root.innerHTML = `
     <div class="sheet-overlay" data-action="sheet-close"></div>
     <div class="sheet" role="dialog" aria-modal="true" aria-label="${esc(s.title || '')}">
@@ -2202,6 +2220,267 @@ function sheetStores() {
     </div>`;
 }
 
+// ---------- doorsturen & suggesties ----------
+
+const SUGGEST_AFTER = 3;
+
+// Winkels om naar door te sturen: alle andere, die waar dit product het vaakst
+// heen ging bovenaan (eerst vanaf deze winkel, dan in totaal).
+function forwardTargets(item) {
+  const p = state.products.get(item.productId);
+  const stats = p?.forwardStats || {};
+  const fromHere = (to) => stats[`${item.storeId}__${to}`] || 0;
+  const total = (to) => Object.entries(stats).reduce((n, [k, v]) => (k.endsWith(`__${to}`) ? n + (v || 0) : n), 0);
+  return state.stores
+    .filter((s) => s.id !== item.storeId)
+    .map((s, i) => ({ s, i, a: fromHere(s.id), b: total(s.id) }))
+    .sort((x, y) => y.a - x.a || y.b - x.b || x.i - y.i)
+    .map((x) => ({ store: x.s, count: x.a }));
+}
+
+function openForward(item) {
+  if (!item || state.stores.length < 2) {
+    if (item) toast('Er is geen andere winkel om naar door te sturen');
+    return;
+  }
+  openSheet({ mode: 'forward', title: `${item.name} doorsturen`, itemId: item.id });
+}
+
+function sheetForward(s) {
+  const item = state.items.find((i) => i.id === s.itemId);
+  if (!item) return '<div class="sheet-body"><p class="muted">Item niet gevonden.</p></div>';
+  const from = storeById(item.storeId);
+  return `
+    <div class="sheet-body">
+      <div>
+        <p class="eyebrow">doorsturen${from ? ` · nu bij ${esc(from.name)}` : ''}</p>
+        <h2 class="sheet-title">${esc(item.name)} naar…</h2>
+      </div>
+      <div class="store-pick">
+        ${forwardTargets(item)
+          .map(
+            ({ store, count }) => `<button class="store-pick-row" data-action="forward-to" data-id="${store.id}">
+              <span>${esc(store.name)}</span><span class="mono muted small">${count ? `${count}× eerder` : ''}</span>
+            </button>`,
+          )
+          .join('')}
+      </div>
+      <button class="btn btn-ghost btn-block" data-action="sheet-close">Annuleren</button>
+    </div>`;
+}
+
+async function forwardItem(itemId, toStoreId) {
+  const item = state.items.find((i) => i.id === itemId);
+  const to = storeById(toStoreId);
+  if (!item || !to || to.id === item.storeId) return;
+  const product = liveProduct(item.productId);
+  const changes = { storeId: to.id, sectionId: resolveSection(product, to, item.name) };
+  const actionId = await run(() =>
+    updateItem(state.hid, state.user, item, changes, null, { productOwnerUid: productOwner(item.productId) }),
+  );
+  if (actionId) toast(`${item.name} → ${to.name}`, actionId);
+}
+
+// Suggestie: dit product ging minstens 3x in dezelfde richting, naar een andere
+// winkel dan de vaste. Geeft { product, key, from, to, count } of null.
+function suggestionFor(p) {
+  if (!p || p.deleted || !p.name || p.suggestOff) return null;
+  if (p.ownerUid !== SHARED && p.ownerUid !== state.user.uid) return null;
+  let best = null;
+  for (const [key, n] of Object.entries(p.forwardStats || {})) {
+    if ((n || 0) < SUGGEST_AFTER) continue;
+    const [fromId, toId] = key.split('__');
+    const to = storeById(toId);
+    if (!to || toId === p.preferredStoreId) continue;
+    if (!best || n > best.count) best = { product: p, key, from: storeById(fromId), to, count: n };
+  }
+  return best;
+}
+
+function allSuggestions() {
+  return [...state.products.values()]
+    .map(suggestionFor)
+    .filter(Boolean)
+    .sort((a, b) => a.product.name.localeCompare(b.product.name, 'nl'));
+}
+
+function suggestionLine(sg) {
+  return `<span class="product-name">${esc(sg.product.name)}</span>
+    <span class="muted small">${esc(sg.from?.name || '?')} → ${esc(sg.to.name)} · ${sg.count}×</span>`;
+}
+
+function suggestionsCard() {
+  const list = allSuggestions();
+  if (!list.length) return '';
+  return `
+    <section class="card suggest-card">
+      <h2 class="card-title">${list.length === 1 ? '1 suggestie' : `${list.length} suggesties`} voor de vaste winkel</h2>
+      ${list
+        .map(
+          (sg) => `<button class="suggest-row" data-action="suggest-open" data-id="${esc(sg.product.id)}">
+            <span class="suggest-text">${suggestionLine(sg)}</span>${icon('next', 18)}
+          </button>`,
+        )
+        .join('')}
+    </section>`;
+}
+
+// pendingAdd: { text } — het item dat na het antwoord op de lijst moet.
+function openSuggestion(productId, pendingAdd = null) {
+  const sg = suggestionFor(state.products.get(productId));
+  if (!sg) return false;
+  openSheet({ mode: 'suggest', title: 'Vaste winkel', productId, key: sg.key, pendingAdd, step: 'ask' });
+  return true;
+}
+
+// Items van dit product die nu op de lijst staan, niet bij de voorgestelde winkel.
+const openElsewhere = (p, toId) => liveItems().filter((i) => i.productId === p.id && !i.checked && i.storeId !== toId);
+
+function sheetSuggest(s) {
+  const p = state.products.get(s.productId);
+  const sg = suggestionFor(p);
+  if (!sg || sg.key !== s.key) return '<div class="sheet-body"><p class="muted">Deze suggestie is al beantwoord.</p><button class="btn btn-ghost btn-block" data-action="sheet-close">Sluiten</button></div>';
+  const current = storeById(p.preferredStoreId);
+  if (s.step === 'move') {
+    const items = openElsewhere(p, sg.to.id);
+    return `
+      <div class="sheet-body">
+        <div>
+          <p class="eyebrow">vaste winkel · ${esc(p.name)}</p>
+          <h2 class="sheet-title">Ook verplaatsen naar ${esc(sg.to.name)}?</h2>
+          <p class="muted small">Er ${items.length === 1 ? 'staat' : 'staan'} nog ${items.length} op de lijst bij ${esc(
+            [...new Set(items.map((i) => storeById(i.storeId)?.name || '?'))].join(', '),
+          )}.</p>
+        </div>
+        <button class="btn btn-primary btn-block" data-action="suggest-answer" data-answer="yes-move">Ja, ook verplaatsen</button>
+        <button class="btn btn-ghost btn-block" data-action="suggest-answer" data-answer="yes-stay">Nee, laten staan</button>
+      </div>`;
+  }
+  return `
+    <div class="sheet-body">
+      <div>
+        <p class="eyebrow">vaste winkel</p>
+        <h2 class="sheet-title">${esc(p.name)} ging ${sg.count}x van ${esc(sg.from?.name || '?')} naar ${esc(sg.to.name)}</h2>
+        <p class="muted">Voortaan bij ${esc(sg.to.name)}?${current ? ` Nu is ${esc(current.name)} de vaste winkel.` : ''}</p>
+      </div>
+      <button class="btn btn-primary btn-block" data-action="suggest-answer" data-answer="yes">Ja, voortaan bij ${esc(sg.to.name)}</button>
+      <button class="btn btn-ghost btn-block" data-action="suggest-answer" data-answer="no">Nee${current ? `, ${esc(current.name)} blijft` : ''}</button>
+      <button class="btn btn-ghost btn-block" data-action="suggest-answer" data-answer="never">Nooit vragen voor ${esc(p.name)}</button>
+      ${s.pendingAdd ? `<p class="muted small center">Daarna komt ${esc(p.name)} op de lijst.</p>` : ''}
+    </div>`;
+}
+
+async function answerSuggestion(answer) {
+  const s = state.sheet;
+  const p = state.products.get(s?.productId);
+  const sg = suggestionFor(p);
+  if (!sg || sg.key !== s.key) return closeSheet();
+  if (answer === 'yes' && openElsewhere(p, sg.to.id).length) {
+    s.step = 'move';
+    renderSheet();
+    return;
+  }
+  const pendingAdd = s.pendingAdd;
+  s.answered = true;
+  closeSheet();
+
+  const changes = [];
+  const effects = [];
+  let label;
+  // De teller van deze richting gaat terug naar 0 (bij ja én nee).
+  const reset = { productId: p.id, ownerUid: p.ownerUid, path: ['forwardStats', sg.key], delta: -sg.count };
+  if (answer === 'never') {
+    changes.push({ col: 'products', id: p.id, before: { suggestOff: !!p.suggestOff }, after: { suggestOff: true } });
+    label = `Geen suggesties meer voor ${p.name}`;
+  } else if (answer === 'no') {
+    effects.push(reset);
+    label = `${p.name} blijft bij ${storeById(p.preferredStoreId)?.name || 'de vaste winkel'}`;
+  } else {
+    effects.push(reset);
+    changes.push({ col: 'products', id: p.id, before: { preferredStoreId: p.preferredStoreId ?? null }, after: { preferredStoreId: sg.to.id } });
+    label = `${p.name} voortaan bij ${sg.to.name}`;
+    if (answer === 'yes-move') {
+      const items = openElsewhere(p, sg.to.id);
+      for (const i of items) {
+        changes.push({
+          col: 'items',
+          id: i.id,
+          before: { storeId: i.storeId, sectionId: i.sectionId ?? null },
+          after: { storeId: sg.to.id, sectionId: resolveSection(p, sg.to, i.name) },
+        });
+      }
+      if (items.length) label += ` (${items.length} verplaatst)`;
+    }
+  }
+  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: p.ownerUid, changes, effects }));
+  if (res?.actionId) toast(label, res.actionId);
+  // Wachten op de nieuwe stand, dan pas het item toevoegen (bij de juiste winkel).
+  if (pendingAdd && res) setTimeout(() => quickAdd(pendingAdd.text, { skipSuggest: true }), 150);
+}
+
+// Swipen op een item: links = doorsturen, rechts = afvinken.
+const SWIPE_MIN = 70;
+let swipe = null;
+let suppressClick = false;
+
+document.addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'mouse') return;
+  const row = e.target.closest('.item[data-swipe]');
+  if (!row) return;
+  // Randen vrijlaten voor de terug-gebaar van de telefoon.
+  if (e.clientX < 24 || e.clientX > window.innerWidth - 24) return;
+  swipe = { row, id: row.dataset.swipe, x: e.clientX, y: e.clientY, dx: 0, active: false };
+});
+
+document.addEventListener(
+  'pointermove',
+  (e) => {
+    if (!swipe) return;
+    const dx = e.clientX - swipe.x;
+    const dy = e.clientY - swipe.y;
+    if (!swipe.active) {
+      if (Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) {
+        swipe = null; // gewoon scrollen
+        return;
+      }
+      if (Math.abs(dx) < 12) return;
+      swipe.active = true;
+    }
+    swipe.dx = dx;
+    swipe.row.style.transform = `translateX(${Math.max(-120, Math.min(120, dx))}px)`;
+    swipe.row.classList.toggle('swipe-left', dx < -SWIPE_MIN);
+    swipe.row.classList.toggle('swipe-right', dx > SWIPE_MIN);
+  },
+  { passive: true },
+);
+
+function endSwipe() {
+  if (!swipe) return;
+  const { row, id, dx, active } = swipe;
+  swipe = null;
+  row.style.transform = '';
+  row.classList.remove('swipe-left', 'swipe-right');
+  if (!active) return;
+  suppressClick = true;
+  setTimeout(() => (suppressClick = false), 350);
+  const item = state.items.find((i) => i.id === id);
+  if (!item) return;
+  if (dx < -SWIPE_MIN) openForward(item);
+  else if (dx > SWIPE_MIN) toggleItem(item);
+}
+document.addEventListener('pointerup', endSwipe);
+document.addEventListener('pointercancel', () => {
+  if (!swipe) return;
+  swipe.row.style.transform = '';
+  swipe.row.classList.remove('swipe-left', 'swipe-right');
+  swipe = null;
+});
+
+async function toggleItem(item) {
+  const actionId = await run(() => setItemChecked(state.hid, state.user, item, !item.checked, productOwner(item.productId)));
+  if (actionId) toast(`${item.name} ${item.checked ? 'teruggezet' : 'afgevinkt'}`, actionId);
+}
+
 // ---------- acties ----------
 
 // ---------- historie: acties ----------
@@ -2394,6 +2673,7 @@ async function saveProduct() {
   if (sh.defaultUnit !== (p.defaultUnit || 'st')) after.defaultUnit = sh.defaultUnit;
   if (sh.generalSectionId && sh.generalSectionId !== generalSectionFor(p.sectionId, p.name)) after.sectionId = sh.generalSectionId;
   if (!!sh.recurring !== !!p.recurring) after.recurring = !!sh.recurring;
+  if (!sh.suggest !== !!p.suggestOff) after.suggestOff = !sh.suggest;
   const touched = Object.keys(sh.chainTouched).filter((c) => sh.chainTouched[c]);
   if (touched.length) {
     const map = { ...(p.sectionByChain || {}) };
@@ -2600,7 +2880,7 @@ const productExists = (id) => !!id && !!state.products.get(id)?.name;
 // Eigenaar van het product (als het nog bestaat), voor tellers.
 const productOwner = (id) => (productExists(id) ? state.products.get(id).ownerUid : null);
 
-async function quickAdd(text) {
+async function quickAdd(text, { skipSuggest = false } = {}) {
   const list = activeList();
   const { qty, unit, name } = parseQuickAdd(text);
   if (!name || !list) return false;
@@ -2614,6 +2894,8 @@ async function quickAdd(text) {
 
   const known = productFor(list, key);
   const activeStore = currentStoreId();
+  // Eerst de suggestie voor de vaste winkel beantwoorden, dan pas toevoegen.
+  if (known && !skipSuggest && suggestionFor(known) && openSuggestion(known.id, { text })) return true;
   if (known && (known.sectionId || known.sectionByStore || known.sectionByChain)) {
     const storeId = (storeById(known.preferredStoreId) && known.preferredStoreId) || activeStore;
     const sectionId = resolveSection(known, storeById(storeId), name);
@@ -3009,6 +3291,7 @@ function closeSheetSafe() {
 document.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-action], [data-nav], [data-list], [data-store], [data-theme-set]');
   if (!el || el.disabled) return;
+  if (suppressClick && el.closest('.item[data-swipe]')) return;
 
   if (el.dataset.nav) {
     state.view = el.dataset.nav;
@@ -3065,11 +3348,24 @@ document.addEventListener('click', async (e) => {
 
     case 'toggle': {
       const item = state.items.find((i) => i.id === id);
-      if (!item) break;
-      const actionId = await run(() => setItemChecked(state.hid, state.user, item, !item.checked, productOwner(item.productId)));
-      if (actionId) toast(`${item.name} ${item.checked ? 'teruggezet' : 'afgevinkt'}`, actionId);
+      if (item) await toggleItem(item);
       break;
     }
+    case 'forward-item':
+      openForward(state.items.find((i) => i.id === id));
+      break;
+    case 'forward-to': {
+      const sh = state.sheet;
+      closeSheet();
+      if (sh?.mode === 'forward') await forwardItem(sh.itemId, id);
+      break;
+    }
+    case 'suggest-open':
+      openSuggestion(id);
+      break;
+    case 'suggest-answer':
+      await answerSuggestion(el.dataset.answer);
+      break;
     case 'edit-item': {
       const item = state.items.find((i) => i.id === id);
       if (!item) break;
@@ -3546,6 +3842,10 @@ document.addEventListener('change', async (e) => {
     state.sheet.recurring = t.checked;
     return;
   }
+  if (state.sheet && t.dataset.field === 'suggest') {
+    state.sheet.suggest = t.checked;
+    return;
+  }
   if (state.sheet && t.dataset.field === 'newSectionOnlyStore') {
     state.sheet.newSectionOnlyStore = t.checked;
     return;
@@ -3682,7 +3982,7 @@ document.addEventListener('input', (e) => {
     return;
   }
   const field = e.target.dataset?.field;
-  if (field === 'sectionId' || field === 'newSectionOnlyStore' || field === 'recurring') return;
+  if (field === 'sectionId' || field === 'newSectionOnlyStore' || field === 'recurring' || field === 'suggest') return;
   if (field && state.sheet) state.sheet[field] = e.target.value;
 });
 

@@ -857,6 +857,67 @@ select.input {
   gap: 2px;
 }
 
+/* ---------- doorsturen & suggesties ---------- */
+
+.item {
+  position: relative;
+  touch-action: pan-y;
+  transition: transform 0.15s ease;
+}
+
+.item.swipe-left {
+  box-shadow: inset -4px 0 0 var(--accent);
+}
+
+.item.swipe-right {
+  box-shadow: inset 4px 0 0 var(--accent);
+}
+
+@media (hover: none) {
+  .fwd-btn {
+    display: none;
+  }
+}
+
+.nav-item {
+  position: relative;
+}
+
+.nav-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: top;
+}
+
+.suggest-card {
+  border-color: var(--accent);
+  gap: 4px;
+}
+
+.suggest-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 6px 0;
+  border: none;
+  border-top: 1px solid var(--divider);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.suggest-text {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
 /* ---------- ronde afronden ---------- */
 
 .finish-list {

@@ -46,6 +46,7 @@ import {
   isMemberOf,
   checkHouseholdAccess,
   finishRound,
+  answerSuggestion as answerSuggestionTx,
   watchTrips,
   commitCompound,
   newItemDoc,
@@ -600,7 +601,7 @@ function renderNav() {
     ${NAV.map(
       (n) => `<button class="nav-item${state.view === n.id ? ' is-active' : ''}" data-nav="${n.id}"
         ${state.view === n.id ? 'aria-current="page"' : ''}>${n.label}${
-          n.id === 'producten' && allSuggestions().length ? '<span class="nav-dot" aria-label="suggesties"></span>' : ''
+          n.id === 'producten' && allSuggestions().length ? '<span class="nav-dot" aria-hidden="true"></span><span class="sr-only"> (suggesties)</span>' : ''
         }</button>`,
     ).join('')}`;
 }
@@ -1932,10 +1933,7 @@ function openSheet(sheet) {
 
 function closeSheet() {
   // Suggestie-vraag weggeklikt zonder antwoord: het item toch toevoegen.
-  const sh = state.sheet;
-  if (sh?.mode === 'suggest' && sh.pendingAdd && !sh.answered) {
-    setTimeout(() => quickAdd(sh.pendingAdd.text, { skipSuggest: true }), 0);
-  }
+  releasePending(state.sheet);
   state.sheet = null;
   document.getElementById('sheet-root').innerHTML = '';
   document.body.classList.remove('sheet-open');
@@ -2325,7 +2323,9 @@ function suggestionsCard() {
     </section>`;
 }
 
-// pendingAdd: { text } — het item dat na het antwoord op de lijst moet.
+// pendingAdd: (storeId|null) => void — voegt het item toe na het antwoord
+// (storeId = de nieuwe vaste winkel bij 'Ja', anders null). Wordt altijd
+// precies één keer uitgevoerd, ook als de vraag wordt weggeklikt.
 function openSuggestion(productId, pendingAdd = null) {
   const sg = suggestionFor(state.products.get(productId));
   if (!sg) return false;
@@ -2380,62 +2380,68 @@ async function answerSuggestion(answer) {
     renderSheet();
     return;
   }
-  const pendingAdd = s.pendingAdd;
-  s.answered = true;
+  // Eerst het item toevoegen (lokaal direct zichtbaar), dan pas het antwoord
+  // opslaan. Mislukt het antwoord, dan staat het item er in elk geval.
+  const yes = answer.startsWith('yes');
+  releasePending(s, yes ? sg.to.id : null);
   closeSheet();
 
-  const changes = [];
-  const effects = [];
   let label;
-  // De teller van deze richting gaat terug naar 0 (bij ja én nee).
-  const reset = { productId: p.id, ownerUid: p.ownerUid, path: ['forwardStats', sg.key], delta: -sg.count };
-  if (answer === 'never') {
-    changes.push({ col: 'products', id: p.id, before: { suggestOff: !!p.suggestOff }, after: { suggestOff: true } });
-    label = `Geen suggesties meer voor ${p.name}`;
-  } else if (answer === 'no') {
-    effects.push(reset);
-    label = `${p.name} blijft bij ${storeById(p.preferredStoreId)?.name || 'de vaste winkel'}`;
-  } else {
-    effects.push(reset);
-    changes.push({ col: 'products', id: p.id, before: { preferredStoreId: p.preferredStoreId ?? null }, after: { preferredStoreId: sg.to.id } });
+  let moves = [];
+  if (answer === 'never') label = `Geen suggesties meer voor ${p.name}`;
+  else if (answer === 'no') label = `${p.name} blijft bij ${storeById(p.preferredStoreId)?.name || 'de vaste winkel'}`;
+  else {
     label = `${p.name} voortaan bij ${sg.to.name}`;
     if (answer === 'yes-move') {
-      const items = openElsewhere(p, sg.to.id);
-      for (const i of items) {
-        changes.push({
-          col: 'items',
-          id: i.id,
-          before: { storeId: i.storeId, sectionId: i.sectionId ?? null },
-          after: { storeId: sg.to.id, sectionId: resolveSection(p, sg.to, i.name) },
-        });
-      }
-      if (items.length) label += ` (${items.length} verplaatst)`;
+      moves = openElsewhere(p, sg.to.id).map((i) => ({
+        id: i.id,
+        before: { storeId: i.storeId, sectionId: i.sectionId ?? null },
+        after: { storeId: sg.to.id, sectionId: resolveSection(p, sg.to, i.name) },
+      }));
+      if (moves.length) label += ` (${moves.length} verplaatst)`;
     }
   }
-  const res = await run(() => commitCompound(state.hid, state.user, { label, ownerUid: p.ownerUid, changes, effects }));
-  if (res?.actionId) toast(label, res.actionId);
-  // Wachten op de nieuwe stand, dan pas het item toevoegen (bij de juiste winkel).
-  if (pendingAdd && res) setTimeout(() => quickAdd(pendingAdd.text, { skipSuggest: true }), 150);
+  const actionId = await run(() =>
+    answerSuggestionTx(state.hid, state.user, {
+      productId: p.id,
+      key: sg.key,
+      toStoreId: sg.to.id,
+      answer: yes ? 'yes' : answer,
+      moves,
+      label,
+      threshold: SUGGEST_AFTER,
+    }),
+  );
+  if (actionId) toast(label, actionId);
+}
+
+// Het wachtende item (van de suggestievraag) precies één keer toevoegen.
+function releasePending(sh, storeId = null) {
+  if (!sh || sh.mode !== 'suggest' || !sh.pendingAdd || sh.released) return;
+  sh.released = true;
+  const fn = sh.pendingAdd;
+  setTimeout(() => fn(storeId), 0);
 }
 
 // Swipen op een item: links = doorsturen, rechts = afvinken.
 const SWIPE_MIN = 70;
 let swipe = null;
-let suppressClick = false;
+let suppressUntil = 0;
 
 document.addEventListener('pointerdown', (e) => {
-  if (e.pointerType === 'mouse') return;
+  suppressUntil = 0;
+  if (e.pointerType === 'mouse' || swipe) return; // geen muis, geen tweede vinger
   const row = e.target.closest('.item[data-swipe]');
-  if (!row) return;
+  if (!row || state.sheet) return;
   // Randen vrijlaten voor de terug-gebaar van de telefoon.
   if (e.clientX < 24 || e.clientX > window.innerWidth - 24) return;
-  swipe = { row, id: row.dataset.swipe, x: e.clientX, y: e.clientY, dx: 0, active: false };
+  swipe = { row, id: row.dataset.swipe, pid: e.pointerId, x: e.clientX, y: e.clientY, dx: 0, active: false };
 });
 
 document.addEventListener(
   'pointermove',
   (e) => {
-    if (!swipe) return;
+    if (!swipe || e.pointerId !== swipe.pid) return;
     const dx = e.clientX - swipe.x;
     const dy = e.clientY - swipe.y;
     if (!swipe.active) {
@@ -2445,34 +2451,38 @@ document.addEventListener(
       }
       if (Math.abs(dx) < 12) return;
       swipe.active = true;
+      swipe.row.classList.add('is-swiping');
     }
     swipe.dx = dx;
     swipe.row.style.transform = `translateX(${Math.max(-120, Math.min(120, dx))}px)`;
-    swipe.row.classList.toggle('swipe-left', dx < -SWIPE_MIN);
+    swipe.row.classList.toggle('swipe-left', dx < -SWIPE_MIN && !swipe.row.classList.contains('is-checked'));
     swipe.row.classList.toggle('swipe-right', dx > SWIPE_MIN);
   },
   { passive: true },
 );
 
-function endSwipe() {
-  if (!swipe) return;
+function resetSwipeRow(row) {
+  row.classList.remove('is-swiping', 'swipe-left', 'swipe-right');
+  row.style.transform = '';
+}
+
+function endSwipe(e) {
+  if (!swipe || e.pointerId !== swipe.pid) return;
   const { row, id, dx, active } = swipe;
   swipe = null;
-  row.style.transform = '';
-  row.classList.remove('swipe-left', 'swipe-right');
+  resetSwipeRow(row);
   if (!active) return;
-  suppressClick = true;
-  setTimeout(() => (suppressClick = false), 350);
+  // De klik die de browser na een swipe soms nog stuurt negeren (alleen meteen erna).
+  suppressUntil = Date.now() + 350;
   const item = state.items.find((i) => i.id === id);
   if (!item) return;
-  if (dx < -SWIPE_MIN) openForward(item);
+  if (dx < -SWIPE_MIN && !item.checked) openForward(item); // afgevinkt: niet doorsturen
   else if (dx > SWIPE_MIN) toggleItem(item);
 }
 document.addEventListener('pointerup', endSwipe);
-document.addEventListener('pointercancel', () => {
-  if (!swipe) return;
-  swipe.row.style.transform = '';
-  swipe.row.classList.remove('swipe-left', 'swipe-right');
+document.addEventListener('pointercancel', (e) => {
+  if (!swipe || e.pointerId !== swipe.pid) return;
+  resetSwipeRow(swipe.row);
   swipe = null;
 });
 
@@ -2517,14 +2527,17 @@ function backStoreFor(t, line) {
   return preferred || storeById(t.storeId) || storeById(p?.preferredStoreId) || state.stores[0] || null;
 }
 
-async function tripAgain(t, line) {
+async function tripAgain(t, line, { skipSuggest = false, storeId: forceStore = null } = {}) {
   const list = listForTrip(t);
   if (!list) return toast('Die lijst bestaat niet meer');
   const key = productKey(line.name);
   const known = liveProduct(line.productId)?.ownerUid === list.ownerUid ? liveProduct(line.productId) : productFor(list, key);
   const pid = known && known.ownerUid === list.ownerUid ? known.id : pidFor(list.ownerUid, key);
   const p = known;
-  const store = storeById(p?.preferredStoreId) || storeById(t.storeId) || storeById(currentStoreId());
+  if (p && !skipSuggest && suggestionFor(p)) {
+    if (openSuggestion(p.id, (sid) => tripAgain(t, line, { skipSuggest: true, storeId: sid }))) return;
+  }
+  const store = storeById(forceStore) || storeById(p?.preferredStoreId) || storeById(t.storeId) || storeById(currentStoreId());
   if (!store) return toast('Geen winkel gevonden');
   const dup = liveItems().find((i) => i.listId === list.id && !i.checked && i.key === key);
   if (dup) return toast(`${dup.name} staat al op de lijst bij ${storeById(dup.storeId)?.name || 'een winkel'}`);
@@ -2880,8 +2893,8 @@ const productExists = (id) => !!id && !!state.products.get(id)?.name;
 // Eigenaar van het product (als het nog bestaat), voor tellers.
 const productOwner = (id) => (productExists(id) ? state.products.get(id).ownerUid : null);
 
-async function quickAdd(text, { skipSuggest = false } = {}) {
-  const list = activeList();
+async function quickAdd(text, { skipSuggest = false, listId = null, storeId: forceStore = null } = {}) {
+  const list = (listId && state.lists.find((l) => l.id === listId)) || activeList();
   const { qty, unit, name } = parseQuickAdd(text);
   if (!name || !list) return false;
   const key = productKey(name);
@@ -2895,9 +2908,12 @@ async function quickAdd(text, { skipSuggest = false } = {}) {
   const known = productFor(list, key);
   const activeStore = currentStoreId();
   // Eerst de suggestie voor de vaste winkel beantwoorden, dan pas toevoegen.
-  if (known && !skipSuggest && suggestionFor(known) && openSuggestion(known.id, { text })) return true;
+  if (known && !skipSuggest && suggestionFor(known)) {
+    const lid = list.id;
+    if (openSuggestion(known.id, (sid) => quickAdd(text, { skipSuggest: true, listId: lid, storeId: sid }))) return true;
+  }
   if (known && (known.sectionId || known.sectionByStore || known.sectionByChain)) {
-    const storeId = (storeById(known.preferredStoreId) && known.preferredStoreId) || activeStore;
+    const storeId = (storeById(forceStore) && forceStore) || (storeById(known.preferredStoreId) && known.preferredStoreId) || activeStore;
     const sectionId = resolveSection(known, storeById(storeId), name);
     const pid = pidFor(list.ownerUid, key);
     const fields = {
@@ -3291,7 +3307,10 @@ function closeSheetSafe() {
 document.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-action], [data-nav], [data-list], [data-store], [data-theme-set]');
   if (!el || el.disabled) return;
-  if (suppressClick && el.closest('.item[data-swipe]')) return;
+  if (Date.now() < suppressUntil && el.closest('.item[data-swipe]')) {
+    suppressUntil = 0;
+    return;
+  }
 
   if (el.dataset.nav) {
     state.view = el.dataset.nav;
@@ -4204,6 +4223,7 @@ function syncHistory() {
 // De bovenste laag sluiten, zonder zelf de geschiedenis aan te raken.
 function closeTopLayer() {
   if (state.sheet) {
+    releasePending(state.sheet);
     state.sheet = null;
     document.getElementById('sheet-root').innerHTML = '';
     document.body.classList.remove('sheet-open');

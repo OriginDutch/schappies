@@ -952,6 +952,41 @@ export async function commitCompound(hid, user, { label, ownerUid = SHARED, crea
   return { actionId: aRef.id, ids: createRefs.map((r) => r.id) };
 }
 
+// Suggestie voor de vaste winkel beantwoorden, als transactie: wie het eerst
+// antwoordt beslist. answer: 'yes' | 'no' | 'never'.
+// moves: [{ id, before, after }] — items die meeverhuizen (alleen bij 'yes').
+export async function answerSuggestion(hid, user, { productId, key, toStoreId, answer, moves = [], label, threshold = 3 }) {
+  await pendingWritesOrOffline();
+  const pRef = ref(hid, 'products', productId);
+  const aRef = doc(col(hid, 'activity'));
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(pRef);
+    const p = snap.exists() ? snap.data() : null;
+    const n = p?.forwardStats?.[key] || 0;
+    if (!p || p.deleted || p.suggestOff || n < threshold || p.preferredStoreId === toStoreId) {
+      throw conflict('Deze suggestie is net al beantwoord.');
+    }
+    const changes = [];
+    // Teller van deze richting terug naar 0 (met de echte stand van de server).
+    const effects = [{ productId, ownerUid: p.ownerUid, path: ['forwardStats', key], delta: -n }];
+    applyProductEffect(tx, hid, effects[0]);
+    const after = {};
+    if (answer === 'never') after.suggestOff = true;
+    if (answer === 'yes') after.preferredStoreId = toStoreId;
+    if (Object.keys(after).length) {
+      const before = Object.fromEntries(Object.keys(after).map((k) => [k, p[k] ?? (k === 'suggestOff' ? false : null)]));
+      tx.update(pRef, { ...after, updatedAt: serverTimestamp() });
+      changes.push({ col: 'products', id: productId, before, after });
+    }
+    for (const m of answer === 'yes' ? moves : []) {
+      tx.update(ref(hid, 'items', m.id), { ...m.after, updatedAt: serverTimestamp(), updatedBy: user.uid });
+      changes.push({ col: 'items', id: m.id, before: m.before, after: m.after });
+    }
+    tx.set(aRef, logEntry(user, { type: 'compound', label, ownerUid: p.ownerUid, changes, effects }));
+  });
+  return aRef.id;
+}
+
 // Regels die langer dan een week in de prullenbak van een ronde liggen opruimen.
 export async function purgeTripLines(hid, user, trip, lineIds) {
   await runTransaction(db, async (tx) => {
